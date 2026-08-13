@@ -218,6 +218,153 @@ class Join:
             pass
 
 
+# ------------------------------------------------------- querier analysis ---
+
+def _decode_exp(code):
+    """IGMPv3 exponential encoding (Max Resp Code / QQIC, values >= 128)."""
+    if code < 128:
+        return code
+    mant = code & 0x0F
+    exp = (code >> 4) & 0x07
+    return (mant | 0x10) << (exp + 3)
+
+
+def _ping_once(ip):
+    cmd = {"Darwin": ["ping", "-c", "1", "-t", "2", ip],
+           "Windows": ["ping", "-n", "1", "-w", "1000", ip]}.get(
+        SYSTEM, ["ping", "-c", "1", "-W", "2", ip])
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=4,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _arp_lookup(ip):
+    try:
+        if SYSTEM == "Windows":
+            out = subprocess.check_output(
+                ["arp", "-a", ip], text=True, errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            m = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", out)
+            return m.group(1).replace("-", ":").lower() if m else None
+        if SYSTEM == "Darwin":
+            out = subprocess.check_output(["arp", "-n", ip], text=True, errors="replace")
+        else:
+            out = subprocess.check_output(["ip", "neigh", "show", ip], text=True, errors="replace")
+        m = re.search(r"((?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})", out)
+        if not m:
+            return None
+        # macOS prints single-digit octets ("0:1a:..") — normalize
+        return ":".join(f"{int(o, 16):02x}" for o in m.group(1).split(":"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _vendor_lookup(mac):
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"https://api.macvendors.com/{mac}", timeout=4) as r:
+            return r.read().decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class QuerierMonitor:
+    """Listens for IGMP membership queries on a raw socket (needs root/admin)."""
+
+    def __init__(self, iface_ip):
+        self.iface_ip = iface_ip
+        self.queriers = {}   # src ip -> info dict
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
+        if SYSTEM == "Windows":
+            # raw receive on Windows needs a bound socket; RCVALL captures
+            # multicast reliably (we filter for IGMP in the parser)
+            sock.bind((iface_ip, 0))
+            try:
+                sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            except OSError:
+                pass
+        sock.settimeout(0.5)
+        self.sock = sock
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                pkt = self.sock.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+                continue
+            try:
+                self._parse(pkt)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _parse(self, pkt):
+        if len(pkt) < 28 or pkt[0] >> 4 != 4 or pkt[9] != 2:
+            return
+        ihl = (pkt[0] & 0x0F) * 4
+        igmp = pkt[ihl:]
+        if len(igmp) < 8 or igmp[0] != 0x11:
+            return  # only membership queries interest us
+        src = socket.inet_ntoa(pkt[12:16])
+        group = socket.inet_ntoa(igmp[4:8])
+        now = time.time()
+        if len(igmp) >= 12:
+            version = 3
+            qqic = _decode_exp(igmp[9]) or None
+            max_resp = _decode_exp(igmp[1]) / 10.0
+        elif igmp[1] == 0:
+            version, qqic, max_resp = 1, None, 10.0  # v1: fixed 10 s
+        else:
+            version, qqic, max_resp = 2, None, igmp[1] / 10.0
+        need_mac = False
+        with self.lock:
+            q = self.queriers.setdefault(src, {"measured": None, "last_general": None})
+            q.update(version=version, qqic=qqic, max_resp=max_resp, last_seen=now)
+            if group == "0.0.0.0":  # general query -> measure real interval
+                if q["last_general"]:
+                    q["measured"] = now - q["last_general"]
+                q["last_general"] = now
+            if "mac" not in q and src != "0.0.0.0":
+                q["mac"] = None  # reserved: only one resolver thread per source
+                need_mac = True
+        if need_mac:
+            threading.Thread(target=self._resolve, args=(src,), daemon=True).start()
+
+    def _resolve(self, ip):
+        _ping_once(ip)  # populate the ARP cache
+        mac = _arp_lookup(ip)
+        vendor = _vendor_lookup(mac) if mac else None
+        with self.lock:
+            self.queriers[ip]["mac"] = mac
+            self.queriers[ip]["vendor"] = vendor
+
+    def status(self):
+        now = time.time()
+        with self.lock:
+            items = [dict(q, ip=ip, ago=now - q["last_seen"])
+                     for ip, q in self.queriers.items()]
+        items.sort(key=lambda q: socket.inet_aton(q["ip"]))
+        if items:
+            items[0]["elected"] = True  # lowest IP wins the querier election
+        return items
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def fmt_rate(bps):
     if bps >= 1e6:
         return f"{bps / 1e6:.2f} Mbit/s"
@@ -273,6 +420,20 @@ class App:
             "Ohne Source: ASM-Join (IGMPv2/v3) · mit Source: SSM-Join (IGMPv3). "
             "Mit UDP-Port werden empfangene Pakete und Bitrate angezeigt."
         )).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(0, 6))
+
+        qf = ttk.LabelFrame(root, text=" Querier-Analyse ")
+        qf.pack(fill="x", padx=12, pady=(0, 4))
+        qtop = ttk.Frame(qf)
+        qtop.pack(fill="x", padx=6, pady=(4, 0))
+        self.q_btn = ttk.Button(qtop, text="Analyse starten", command=self.toggle_querier)
+        self.q_btn.pack(side="left")
+        self.qmon = None
+        self.q_text = tk.StringVar(value=(
+            "Lauscht auf IGMP-Queries des gewählten Interfaces: Querier-IP, Version, "
+            "Query-Intervall, MAC + Hersteller. Benötigt Root-/Administratorrechte."))
+        ttk.Label(qf, textvariable=self.q_text, justify="left",
+                  font=("Courier" if SYSTEM == "Windows" else "Menlo", 12)
+                  ).pack(fill="x", padx=8, pady=(4, 8))
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=12, pady=(6, 0))
@@ -360,6 +521,57 @@ class App:
         self.e_group.delete(0, "end")
         self.e_source.delete(0, "end")
 
+    def toggle_querier(self):
+        if self.qmon:
+            self.qmon.stop()
+            self.qmon = None
+            self.q_btn.configure(text="Analyse starten")
+            self.q_text.set("Analyse gestoppt.")
+            return
+        idx = self.c_iface.current()
+        if idx < 0 or idx >= len(self.ifaces):
+            self.q_text.set("Bitte ein Interface auswählen.")
+            return
+        _name, ip = self.ifaces[idx]
+        try:
+            self.qmon = QuerierMonitor(ip)
+        except OSError:
+            if SYSTEM == "Windows":
+                self.q_text.set("Zugriff verweigert — bitte die App per Rechtsklick → "
+                                "'Als Administrator ausführen' starten.")
+            else:
+                self.q_text.set("Zugriff verweigert — Raw-Socket benötigt Root. Im Terminal:\n"
+                                "sudo \"…/IGMP Test Tool.app/Contents/MacOS/IGMP Test Tool\"  "
+                                "bzw.  sudo python3 igmp_join_gui.py")
+            return
+        self.q_btn.configure(text="Analyse stoppen")
+        self.q_text.set("Warte auf IGMP-Queries … "
+                        "(General Queries kommen typischerweise alle 60–125 s)")
+
+    @staticmethod
+    def _format_queriers(qs):
+        lines = []
+        for q in qs:
+            head = f"Querier {q['ip']}  (IGMPv{q['version']})"
+            if q.get("elected") and len(qs) > 1:
+                head += "  ← aktiv (niedrigste IP gewinnt die Wahl)"
+            iv = []
+            if q.get("qqic"):
+                iv.append(f"{q['qqic']} s (QQIC)")
+            if q.get("measured"):
+                iv.append(f"{q['measured']:.1f} s gemessen")
+            lines.append(head)
+            lines.append(f"  Query-Intervall: {' / '.join(iv) if iv else 'noch unbekannt'}"
+                         f" · Max Resp: {q['max_resp']:.1f} s · zuletzt vor {q['ago']:.0f} s")
+            if q["ip"] == "0.0.0.0":
+                mac_s = "nicht ermittelbar (Proxy-Query mit Source 0.0.0.0)"
+            elif q.get("mac"):
+                mac_s = f"{q['mac']} — {q.get('vendor') or 'Hersteller nicht auflösbar'}"
+            else:
+                mac_s = "wird ermittelt …"
+            lines.append(f"  MAC: {mac_s}")
+        return "\n".join(lines)
+
     def leave_selected(self):
         sel = self.tree.selection()
         for item in sel:
@@ -398,11 +610,17 @@ class App:
                     "●", j.group, j.source or "*", f"{j.iface_name} ({j.iface_ip})",
                     j.port or "—", pkts_s, rate_s, fmt_uptime(now - j.started)),
                     tags=(tag,))
+            if self.qmon:
+                qs = self.qmon.status()
+                if qs:
+                    self.q_text.set(self._format_queriers(qs))
         except Exception:  # noqa: BLE001
             _log_crash("tick", *sys.exc_info())
         self.root.after(1000, self.tick)
 
     def on_close(self):
+        if self.qmon:
+            self.qmon.stop()
         for j in self.joins.values():
             j.leave()
         self.root.destroy()

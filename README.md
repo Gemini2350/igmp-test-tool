@@ -49,6 +49,25 @@ Der grüne Punkt pulsiert, solange Pakete ankommen. Joins bleiben aktiv,
 bis sie per **Leave** / **Alle verlassen** beendet werden oder das Tool
 geschlossen wird (IGMP Leave wird sauber gesendet).
 
+## Querier-Analyse
+
+Beide Varianten können den IGMP-Querier im Netz analysieren (Button
+"Analyse starten"): Querier-IP, IGMP-Version (v1/v2/v3), Query-Intervall
+(bei v3 aus dem QQIC-Feld, zusätzlich real gemessen zwischen zwei General
+Queries), Max Response Time, MAC-Adresse des Queriers samt Hersteller
+(OUI-Lookup online via macvendors.com) und — falls mehrere Querier
+sichtbar sind — wer die Wahl gewinnt (niedrigste IP).
+
+Dafür wird ein Raw-Socket benötigt (**Root/Administrator**):
+
+- **Windows**: exe per Rechtsklick → *Als Administrator ausführen*
+- **macOS**: `sudo "…/IGMP Test Tool.app/Contents/MacOS/IGMP Test Tool"`
+  bzw. `sudo python3 igmp_join_gui.py` / `sudo python3 igmp_join_tool.py`
+
+General Queries kommen typischerweise nur alle 60–125 s — nach dem Start
+der Analyse entsprechend kurz warten. Joins/Statistik funktionieren
+weiterhin ohne erhöhte Rechte.
+
 ## Hinweise
 
 - Ob IGMPv2 oder v3 gesendet wird, entscheidet der OS-Stack (bzw. der
