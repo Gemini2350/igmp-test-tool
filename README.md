@@ -10,11 +10,17 @@ identischem Funktionsumfang:
 | Native App | `igmp_join_gui.py` | Tkinter (als ausführbare Datei baubar) |
 | Web-GUI | `igmp_join_tool.py` | Browser auf `http://127.0.0.1:8688` |
 
+## Download
+
+Fertige macOS-App (Apple Silicon) unter
+[**Releases**](https://github.com/Gemini2350/igmp-test-tool/releases) —
+entpacken und starten.
+
 ## Native App / ausführbare Datei
 
-- **macOS**: fertige App unter `dist/IGMP Test Tool.app` (ad-hoc signiert).
-  Beim Kopieren auf einen anderen Mac setzt Gatekeeper das Quarantäne-Flag —
-  dann einmalig Rechtsklick → Öffnen, oder `xattr -cr "IGMP Test Tool.app"`.
+- **macOS**: fertige App im [Release](https://github.com/Gemini2350/igmp-test-tool/releases)
+  (ad-hoc signiert). Gatekeeper setzt beim Download das Quarantäne-Flag —
+  einmalig Rechtsklick → Öffnen, oder `xattr -cr "IGMP Test Tool.app"`.
 - **Windows**: `.exe` muss einmalig auf einem Windows-Rechner gebaut werden —
   Doppelklick auf `build_windows.bat` (braucht Python von python.org),
   Ergebnis liegt danach in `dist\IGMP Test Tool.exe` und läuft ohne Python.
@@ -27,7 +33,7 @@ python3 igmp_join_tool.py
 ```
 
 Windows: `py igmp_join_tool.py` — oder einfach Doppelklick auf
-`Start IGMP Tool.bat` (Mac: `Start IGMP Tool.command`, ggf. einmalig
+`Start IGMP Test Tool.bat` (Mac: `Start IGMP Test Tool.command`, ggf. einmalig
 `chmod +x` bzw. Rechtsklick → Öffnen wegen Gatekeeper).
 
 Der Browser öffnet sich automatisch auf `http://127.0.0.1:8688`.
