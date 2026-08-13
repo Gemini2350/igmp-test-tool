@@ -12,19 +12,16 @@ identischem Funktionsumfang:
 
 ## Download
 
-Fertige macOS-App (Apple Silicon) unter
-[**Releases**](https://github.com/Gemini2350/igmp-test-tool/releases) —
-entpacken und starten.
+Fertige Builds unter [**Releases**](https://github.com/Gemini2350/igmp-test-tool/releases)
+(automatisch per GitHub Actions gebaut):
 
-## Native App / ausführbare Datei
-
-- **macOS**: fertige App im [Release](https://github.com/Gemini2350/igmp-test-tool/releases)
-  (ad-hoc signiert). Gatekeeper setzt beim Download das Quarantäne-Flag —
-  einmalig Rechtsklick → Öffnen, oder `xattr -cr "IGMP Test Tool.app"`.
-- **Windows**: `.exe` muss einmalig auf einem Windows-Rechner gebaut werden —
-  Doppelklick auf `build_windows.bat` (braucht Python von python.org),
-  Ergebnis liegt danach in `dist\IGMP Test Tool.exe` und läuft ohne Python.
-- Direkt ohne Build: `python3 igmp_join_gui.py`.
+- **macOS** (Intel + Apple Silicon, universal): `IGMP-Test-Tool-macOS-universal.zip` —
+  entpacken und starten. Nicht notariell beglaubigt: beim ersten Start
+  Rechtsklick → Öffnen, oder `xattr -cr "IGMP Test Tool.app"`.
+- **Windows**: `IGMP-Test-Tool-Windows.exe` — direkt ausführbar, kein Python
+  nötig (SmartScreen-Warnung einmalig bestätigen). Lokal bauen geht weiterhin
+  mit `build_windows.bat`.
+- Ohne Build: `python3 igmp_join_gui.py`.
 
 ## Web-GUI-Variante starten
 
