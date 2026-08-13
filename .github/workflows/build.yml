@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build universal2 app (Intel + Apple Silicon)
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --windowed --target-architecture universal2 \
+            --name "IGMP Test Tool" igmp_join_gui.py
+          ditto -c -k --keepParent "dist/IGMP Test Tool.app" "IGMP-Test-Tool-macOS-universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS
+          path: IGMP-Test-Tool-macOS-universal.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: IGMP-Test-Tool-macOS-universal.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build exe
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --onefile --windowed --name "IGMP Test Tool" igmp_join_gui.py
+          Copy-Item "dist/IGMP Test Tool.exe" "IGMP-Test-Tool-Windows.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows
+          path: IGMP-Test-Tool-Windows.exe
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: IGMP-Test-Tool-Windows.exe
