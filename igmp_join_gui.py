@@ -8,19 +8,45 @@ Run directly:      python3 igmp_join_gui.py
 Build executable:  pyinstaller --onefile --windowed --name "IGMP Test Tool" igmp_join_gui.py
 """
 
+import faulthandler
 import ipaddress
 import json
+import os
 import platform
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk
 
 SYSTEM = platform.system()
+
+# Unhandled errors land here instead of killing the windowed app silently
+# (PyInstaller --windowed has no console).
+CRASH_LOG = os.path.join(tempfile.gettempdir(), "igmp-test-tool-crash.log")
+
+
+def _log_crash(kind, exc_type, exc_value, exc_tb):
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} [{kind}] ---\n")
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+sys.excepthook = lambda t, v, tb: _log_crash("main", t, v, tb)
+threading.excepthook = lambda a: _log_crash("thread", a.exc_type, a.exc_value, a.exc_traceback)
+try:
+    _fh_file = open(CRASH_LOG, "a")  # keep open for faulthandler (native crashes)
+    faulthandler.enable(_fh_file)
+except OSError:
+    pass
 
 if SYSTEM == "Linux":
     IP_ADD_SOURCE_MEMBERSHIP = getattr(socket, "IP_ADD_SOURCE_MEMBERSHIP", 39)
@@ -92,6 +118,7 @@ class Join:
         self.started = time.time()
         self.packets = 0
         self.bytes = 0
+        self.error = False
         self._stop = threading.Event()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -131,15 +158,48 @@ class Join:
             threading.Thread(target=self._recv_loop, daemon=True).start()
 
     def _recv_loop(self):
+        # Survives the interface going down (Windows raises on recv then):
+        # mark the join as broken, keep the thread alive, and try to re-add
+        # the membership until the interface is back.
         while not self._stop.is_set():
             try:
                 data = self.sock.recv(65536)
                 self.packets += 1
                 self.bytes += len(data)
+                self.error = False
             except socket.timeout:
                 continue
             except OSError:
-                break
+                if self._stop.is_set():
+                    break
+                self.error = True
+                self._stop.wait(1.0)
+                self._try_rejoin()
+            except Exception:  # noqa: BLE001
+                if self._stop.is_set():
+                    break
+                self.error = True
+                self._stop.wait(1.0)
+
+    def _try_rejoin(self):
+        try:
+            if self.source:
+                mreq = pack_mreq_source(self.group, self.source, self.iface_ip)
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+                self.sock.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, mreq)
+            else:
+                mreq = pack_mreq(self.group, self.iface_ip)
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self.error = False
+        except OSError:
+            pass  # interface still down — retry on next loop iteration
 
     def leave(self):
         self._stop.set()
@@ -233,6 +293,7 @@ class App:
                              stretch=c in ("iface", "group", "source"))
         self.tree.tag_configure("rx", foreground="#2e7d32")
         self.tree.tag_configure("idle", foreground="#999")
+        self.tree.tag_configure("err", foreground="#c62828")
         self.tree.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
         self.load_interfaces()
@@ -316,22 +377,29 @@ class App:
         self.prev.clear()
 
     def tick(self):
-        now = time.time()
-        for item, j in self.joins.items():
-            rate_s, pkts_s, rx = "—", "—", False
-            if j.port:
-                pkts_s = f"{j.packets:,}".replace(",", "'")
-                p = self.prev.get(item)
-                if p:
-                    dt = now - p[2]
-                    if dt > 0:
-                        rate_s = fmt_rate(max(0, (j.bytes - p[0]) * 8 / dt))
-                    rx = j.packets > p[1]
-                self.prev[item] = (j.bytes, j.packets, now)
-            self.tree.item(item, values=(
-                "●", j.group, j.source or "*", f"{j.iface_name} ({j.iface_ip})",
-                j.port or "—", pkts_s, rate_s, fmt_uptime(now - j.started)),
-                tags=("rx" if rx else "idle",))
+        try:
+            now = time.time()
+            for item, j in self.joins.items():
+                rate_s, pkts_s, rx = "—", "—", False
+                if j.port:
+                    pkts_s = f"{j.packets:,}".replace(",", "'")
+                    p = self.prev.get(item)
+                    if p:
+                        dt = now - p[2]
+                        if dt > 0:
+                            rate_s = fmt_rate(max(0, (j.bytes - p[0]) * 8 / dt))
+                        rx = j.packets > p[1]
+                    self.prev[item] = (j.bytes, j.packets, now)
+                if j.error:
+                    tag, rate_s = "err", "unterbrochen"
+                else:
+                    tag = "rx" if rx else "idle"
+                self.tree.item(item, values=(
+                    "●", j.group, j.source or "*", f"{j.iface_name} ({j.iface_ip})",
+                    j.port or "—", pkts_s, rate_s, fmt_uptime(now - j.started)),
+                    tags=(tag,))
+        except Exception:  # noqa: BLE001
+            _log_crash("tick", *sys.exc_info())
         self.root.after(1000, self.tick)
 
     def on_close(self):
@@ -342,6 +410,7 @@ class App:
 
 def main():
     root = tk.Tk()
+    root.report_callback_exception = lambda t, v, tb: _log_crash("tk", t, v, tb)
     try:
         ttk.Style().theme_use({"Darwin": "aqua", "Windows": "vista"}.get(SYSTEM, "clam"))
     except tk.TclError:

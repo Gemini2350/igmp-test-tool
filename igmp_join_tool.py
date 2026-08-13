@@ -108,7 +108,7 @@ class Join:
         self.started = time.time()
         self.packets = 0
         self.bytes = 0
-        self.error = None
+        self.rx_error = False
         self._stop = threading.Event()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -150,15 +150,48 @@ class Join:
             t.start()
 
     def _recv_loop(self):
+        # Survives the interface going down (Windows raises on recv then):
+        # mark the join as broken, keep the thread alive, and try to re-add
+        # the membership until the interface is back.
         while not self._stop.is_set():
             try:
                 data = self.sock.recv(65536)
                 self.packets += 1
                 self.bytes += len(data)
+                self.rx_error = False
             except socket.timeout:
                 continue
             except OSError:
-                break
+                if self._stop.is_set():
+                    break
+                self.rx_error = True
+                self._stop.wait(1.0)
+                self._try_rejoin()
+            except Exception:  # noqa: BLE001
+                if self._stop.is_set():
+                    break
+                self.rx_error = True
+                self._stop.wait(1.0)
+
+    def _try_rejoin(self):
+        try:
+            if self.source:
+                mreq = pack_mreq_source(self.group, self.source, self.iface_ip)
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+                self.sock.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, mreq)
+            else:
+                mreq = pack_mreq(self.group, self.iface_ip)
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self.rx_error = False
+        except OSError:
+            pass  # interface still down — retry on next loop iteration
 
     def leave(self):
         self._stop.set()
@@ -187,6 +220,7 @@ class Join:
             "uptime": int(time.time() - self.started),
             "packets": self.packets,
             "bytes": self.bytes,
+            "error": self.rx_error,
         }
 
 
@@ -372,6 +406,8 @@ INDEX_HTML = r"""<!doctype html>
   tr:last-child td { border-bottom: none; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; background: #55606e; }
   .dot.rx { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1.2s infinite; }
+  .dot.err { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+  .errtext { color: var(--danger); }
   @keyframes pulse { 50% { opacity: .45; } }
   .muted { color: var(--muted); }
   .rate { color: var(--accent); font-weight: 600; }
@@ -489,14 +525,17 @@ async function refresh() {
     }
     nprev[j.id] = {bytes: j.bytes, packets: j.packets, t: d.now};
     const tr = document.createElement("tr");
+    const rateCell = j.error ? '<span class="errtext">unterbrochen</span>'
+      : rate === null ? '<span class="muted">—</span>'
+      : '<span class="rate">' + fmtRate(rate) + "</span>";
     tr.innerHTML = `
-      <td><span class="dot ${rx ? "rx" : ""}"></span></td>
+      <td><span class="dot ${j.error ? "err" : rx ? "rx" : ""}"></span></td>
       <td>${j.group}</td>
       <td>${j.source || '<span class="muted">*</span>'}</td>
       <td>${j.iface_name} <span class="muted">(${j.iface_ip})</span></td>
       <td>${j.port || '<span class="muted">—</span>'}</td>
       <td>${j.port ? j.packets.toLocaleString() : '<span class="muted">—</span>'}</td>
-      <td>${rate === null ? '<span class="muted">—</span>' : '<span class="rate">' + fmtRate(rate) + "</span>"}</td>
+      <td>${rateCell}</td>
       <td class="muted">${fmtUp(j.uptime)}</td>
       <td></td>`;
     const btn = document.createElement("button");
