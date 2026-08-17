@@ -13,12 +13,14 @@ Usage:
 import argparse
 import ipaddress
 import json
+import os
 import platform
 import re
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -225,6 +227,13 @@ class Join:
 
 
 # ------------------------------------------------------- querier analysis ---
+#
+# Capturing IGMP queries needs a raw socket, i.e. root/administrator. If the
+# app itself is not privileged, it launches a small *helper* — this same
+# script/executable with `--querier-helper` — through the platform's native
+# elevation dialog (macOS password prompt, Windows UAC, Linux polkit). The
+# helper streams parsed queries back over a loopback TCP connection; the GUI
+# process stays unprivileged and only asks once per session.
 
 def _decode_exp(code):
     """IGMPv3 exponential encoding (Max Resp Code / QQIC, values >= 128)."""
@@ -276,65 +285,59 @@ def _vendor_lookup(mac):
         return None
 
 
-class QuerierMonitor:
-    """Listens for IGMP membership queries on a raw socket (needs root/admin)."""
+def parse_igmp_query(pkt):
+    """Parse a raw IPv4 packet; return an event dict for IGMP membership
+    queries, None for anything else."""
+    if len(pkt) < 28 or pkt[0] >> 4 != 4 or pkt[9] != 2:
+        return None
+    ihl = (pkt[0] & 0x0F) * 4
+    igmp = pkt[ihl:]
+    if len(igmp) < 8 or igmp[0] != 0x11:
+        return None
+    src = socket.inet_ntoa(pkt[12:16])
+    group = socket.inet_ntoa(igmp[4:8])
+    if len(igmp) >= 12:
+        version = 3
+        qqic = _decode_exp(igmp[9]) or None
+        max_resp = _decode_exp(igmp[1]) / 10.0
+    elif igmp[1] == 0:
+        version, qqic, max_resp = 1, None, 10.0  # v1: fixed 10 s
+    else:
+        version, qqic, max_resp = 2, None, igmp[1] / 10.0
+    return {"src": src, "group": group, "version": version,
+            "qqic": qqic, "max_resp": max_resp}
 
-    def __init__(self, iface_ip):
-        self.iface_ip = iface_ip
+
+def open_igmp_raw_socket(iface_ip):
+    """Raw IGMP receive socket — raises PermissionError without privileges."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
+    if SYSTEM == "Windows":
+        # raw receive on Windows needs a bound socket; RCVALL captures
+        # multicast reliably (we filter for IGMP in the parser)
+        sock.bind((iface_ip, 0))
+        try:
+            sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+        except OSError:
+            pass
+    sock.settimeout(0.5)
+    return sock
+
+
+class QuerierState:
+    """Aggregates query events per querier and resolves MAC/vendor."""
+
+    def __init__(self):
         self.queriers = {}   # src ip -> info dict
         self.lock = threading.Lock()
-        self._stop = threading.Event()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
-        if SYSTEM == "Windows":
-            # raw receive on Windows needs a bound socket; RCVALL captures
-            # multicast reliably (we filter for IGMP in the parser)
-            sock.bind((iface_ip, 0))
-            try:
-                sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
-            except OSError:
-                pass
-        sock.settimeout(0.5)
-        self.sock = sock
-        threading.Thread(target=self._loop, daemon=True).start()
 
-    def _loop(self):
-        while not self._stop.is_set():
-            try:
-                pkt = self.sock.recv(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                if self._stop.is_set():
-                    break
-                time.sleep(0.5)
-                continue
-            try:
-                self._parse(pkt)
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _parse(self, pkt):
-        if len(pkt) < 28 or pkt[0] >> 4 != 4 or pkt[9] != 2:
-            return
-        ihl = (pkt[0] & 0x0F) * 4
-        igmp = pkt[ihl:]
-        if len(igmp) < 8 or igmp[0] != 0x11:
-            return  # only membership queries interest us
-        src = socket.inet_ntoa(pkt[12:16])
-        group = socket.inet_ntoa(igmp[4:8])
+    def ingest(self, ev):
         now = time.time()
-        if len(igmp) >= 12:
-            version = 3
-            qqic = _decode_exp(igmp[9]) or None
-            max_resp = _decode_exp(igmp[1]) / 10.0
-        elif igmp[1] == 0:
-            version, qqic, max_resp = 1, None, 10.0  # v1: fixed 10 s
-        else:
-            version, qqic, max_resp = 2, None, igmp[1] / 10.0
+        src, group = ev["src"], ev["group"]
         need_mac = False
         with self.lock:
             q = self.queriers.setdefault(src, {"measured": None, "last_general": None})
-            q.update(version=version, qqic=qqic, max_resp=max_resp, last_seen=now)
+            q.update(version=ev["version"], qqic=ev["qqic"],
+                     max_resp=ev["max_resp"], last_seen=now)
             if group == "0.0.0.0":  # general query -> measure real interval
                 if q["last_general"]:
                     q["measured"] = now - q["last_general"]
@@ -363,12 +366,349 @@ class QuerierMonitor:
             items[0]["elected"] = True  # lowest IP wins the querier election
         return items
 
+
+class RawCaptureSource:
+    """In-process capture — used when we already have privileges."""
+
+    def __init__(self, iface_ip, state):
+        self.sock = open_igmp_raw_socket(iface_ip)
+        self.state = state
+        self._stop = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                pkt = self.sock.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+                continue
+            try:
+                ev = parse_igmp_query(pkt)
+                if ev:
+                    self.state.ingest(ev)
+            except Exception:  # noqa: BLE001
+                pass
+
     def stop(self):
         self._stop.set()
         try:
             self.sock.close()
         except OSError:
             pass
+
+
+_STAGED = {}
+_STAGE_DIRS = []
+
+
+def _stage_for_root(path):
+    """macOS TCC: a root process spawned via osascript may not read files in
+    Desktop/Documents/Downloads/iCloud/external volumes. If our program lives
+    there, copy it (script or whole .app bundle) to a temp dir once per
+    session and run the copy instead."""
+    if SYSTEM != "Darwin":
+        return path
+    home = os.path.expanduser("~")
+    protected = [os.path.join(home, d) for d in ("Desktop", "Documents", "Downloads",
+                                                   "Library/Mobile Documents")] + ["/Volumes"]
+    real = os.path.realpath(path)
+    if not any(real.startswith(p + os.sep) for p in protected):
+        return path
+    if real in _STAGED:
+        return _STAGED[real]
+    import shutil
+    stage = tempfile.mkdtemp(prefix="igmp-test-tool-helper-")
+    _STAGE_DIRS.append(stage)
+    m = re.match(r"^(.*?\.app)/Contents/MacOS/[^/]+$", real)
+    if m:  # frozen .app bundle: copy the bundle, keep the same relative binary path
+        bundle = m.group(1)
+        dst = os.path.join(stage, os.path.basename(bundle))
+        shutil.copytree(bundle, dst, symlinks=True)
+        staged = os.path.join(dst, os.path.relpath(real, bundle))
+    else:
+        staged = os.path.join(stage, os.path.basename(real))
+        shutil.copy2(real, staged)
+    _STAGED[real] = staged
+    return staged
+
+
+def _helper_command(port, token):
+    """argv for launching this program in helper mode."""
+    if getattr(sys, "frozen", False):
+        return [_stage_for_root(sys.executable), "--querier-helper", str(port), token]
+    return [sys.executable, _stage_for_root(os.path.abspath(__file__)),
+            "--querier-helper", str(port), token]
+
+
+class ElevatedHelper:
+    """Launches the elevated capture helper once and keeps it for the whole
+    session, so the user is asked for credentials only once."""
+
+    _shared = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def shared(cls):
+        with cls._lock:
+            if cls._shared is None or cls._shared.dead:
+                cls._shared = cls()
+            return cls._shared
+
+    def __init__(self):
+        self.conn = None
+        self.state = None
+        self.error = None
+        self.dead = False
+        self._pending = None
+        self._proc = None
+        self._send_lock = threading.Lock()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self._listener.settimeout(180)
+        self.port = self._listener.getsockname()[1]
+        import secrets
+        self.token = secrets.token_hex(16)
+        threading.Thread(target=self._accept, daemon=True).start()
+        threading.Thread(target=self._launch, daemon=True).start()
+
+    # -- launching via the platform's elevation dialog ------------------------
+
+    def _launch(self):
+        cmd = _helper_command(self.port, self.token)
+        try:
+            if SYSTEM == "Windows":
+                import ctypes
+                exe, params = cmd[0], subprocess.list2cmdline(cmd[1:])
+                rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 0)
+                if rc <= 32:
+                    self._fail("Elevation cancelled (UAC)" if rc == 5
+                               else f"Could not launch elevated helper (code {rc})")
+            elif SYSTEM == "Darwin":
+                import shlex
+                sh = shlex.join(cmd).replace("\\", "\\\\").replace('"', '\\"')
+                script = f'do shell script "{sh}" with administrator privileges'
+                self._proc = subprocess.Popen(["osascript", "-e", script],
+                                              stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.PIPE, text=True)
+                _out, err = self._proc.communicate()      # blocks while helper runs
+                if self._proc.returncode != 0 and self.conn is None:
+                    self._fail("Authorization cancelled" if "-128" in (err or "")
+                               else f"Could not launch elevated helper: {(err or '').strip()}")
+                self._fail("Helper exited")
+            else:
+                import shutil
+                if not shutil.which("pkexec"):
+                    self._fail("No graphical elevation available — please run with sudo")
+                    return
+                self._proc = subprocess.Popen(["pkexec"] + cmd, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL)
+                self._proc.wait()
+                if self.conn is None:
+                    self._fail("Authorization cancelled" if self._proc.returncode in (126, 127)
+                               else f"Elevated helper exited (code {self._proc.returncode})")
+                self._fail("Helper exited")
+        except Exception as exc:  # noqa: BLE001
+            self._fail(f"Could not launch elevated helper: {exc}")
+
+    def _fail(self, msg):
+        if not self.dead:
+            self.error = msg
+        self.dead = True
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        c, self.conn = self.conn, None
+        if c:
+            try:
+                c.shutdown(socket.SHUT_RDWR)   # makefile() holds a ref; close() alone is silent
+            except OSError:
+                pass
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    # -- connection with the helper -------------------------------------------
+
+    def _accept(self):
+        try:
+            conn, _ = self._listener.accept()
+        except OSError:
+            if not self.dead:
+                self._fail("Timed out waiting for authorization")
+            self._kill_launcher()
+            return
+        try:
+            f = conn.makefile("r", encoding="utf-8")
+            hello = json.loads(f.readline() or "{}")
+            if hello.get("token") != self.token:
+                conn.close()
+                self._fail("Helper handshake failed")
+                return
+            self.conn = conn
+            self.error = None
+            if self._pending:
+                self._send({"cmd": "start", "iface": self._pending})
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if "error" in msg:
+                    self.error = msg["error"]
+                elif "src" in msg and self.state:
+                    self.state.ingest(msg)
+        except OSError:
+            pass
+        self._fail("Helper connection lost")
+
+    def _kill_launcher(self):
+        p = self._proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def _send(self, obj):
+        c = self.conn
+        if not c:
+            return
+        try:
+            with self._send_lock:
+                c.sendall((json.dumps(obj) + "\n").encode())
+        except OSError:
+            self._fail("Helper connection lost")
+
+    # -- API used by QuerierMonitor -------------------------------------------
+
+    def start(self, iface_ip, state):
+        self.state = state
+        self._pending = iface_ip
+        self.error = None
+        if self.conn:
+            self._send({"cmd": "start", "iface": iface_ip})
+
+    def stop_capture(self):
+        self._pending = None
+        self.state = None
+        self._send({"cmd": "stop"})
+
+    def shutdown(self):
+        self._fail("closed")
+        self._kill_launcher()
+
+    @property
+    def connected(self):
+        return self.conn is not None
+
+
+def run_querier_helper(port, token):
+    """Entry point of the elevated helper process (`--querier-helper PORT TOKEN`)."""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+    conn.settimeout(None)
+    lock = threading.Lock()
+    alive = threading.Event()
+    alive.set()
+
+    def send(obj):
+        try:
+            with lock:
+                conn.sendall((json.dumps(obj) + "\n").encode())
+        except OSError:
+            alive.clear()
+
+    class _Relay:
+        def ingest(self, ev):
+            send(ev)
+
+    send({"token": token})
+    capture = None
+
+    def heartbeat():   # detects a vanished GUI, then exits
+        while alive.is_set():
+            time.sleep(2)
+            send({"hb": 1})
+        os._exit(0)
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    try:
+        for line in conn.makefile("r", encoding="utf-8"):
+            try:
+                cmd = json.loads(line)
+            except ValueError:
+                continue
+            if capture:
+                capture.stop()
+                capture = None
+            if cmd.get("cmd") == "start":
+                try:
+                    capture = RawCaptureSource(cmd["iface"], _Relay())
+                    send({"started": cmd["iface"]})
+                except OSError as exc:
+                    send({"error": f"Raw socket failed in elevated helper: {exc}"})
+    except OSError:
+        pass
+    finally:
+        if capture:
+            capture.stop()
+        os._exit(0)
+
+
+class QuerierMonitor:
+    """Facade: captures in-process when privileged, otherwise via the
+    elevated helper. `status()` yields the querier list, `phase()` a
+    human-readable state for the UI."""
+
+    def __init__(self, iface_ip):
+        self.iface_ip = iface_ip
+        self.state = QuerierState()
+        self.local = None
+        self.helper = None
+        try:
+            self.local = RawCaptureSource(iface_ip, self.state)
+        except OSError:
+            self.helper = ElevatedHelper.shared()
+            self.helper.start(iface_ip, self.state)
+
+    def status(self):
+        return self.state.status()
+
+    def phase(self):
+        """('ok'|'wait'|'error', message)"""
+        if self.local:
+            return "ok", "Capturing (running with privileges)"
+        h = self.helper
+        if h.error:
+            return "error", h.error
+        if not h.connected:
+            return "wait", ("Waiting for authorization — please confirm the "
+                            "system dialog (password / UAC) …")
+        return "ok", "Capturing via elevated helper"
+
+    def stop(self):
+        if self.local:
+            self.local.stop()
+        elif self.helper:
+            self.helper.stop_capture()
+
+    @staticmethod
+    def shutdown_helper():
+        h = ElevatedHelper._shared
+        if h:
+            h.shutdown()
+        import shutil
+        for d in _STAGE_DIRS:   # remove staged helper copies (macOS TCC workaround)
+            shutil.rmtree(d, ignore_errors=True)
+        _STAGE_DIRS.clear()
+        _STAGED.clear()
 
 
 QMON = None
@@ -390,12 +730,7 @@ def api_querier(body):
             ipaddress.ip_address(iface_ip)
         except ValueError:
             return {"error": "Please select an interface"}
-        try:
-            QMON = QuerierMonitor(iface_ip)
-        except OSError as exc:
-            hint = ("please run as administrator" if SYSTEM == "Windows"
-                    else "please start with sudo: sudo python3 igmp_join_tool.py")
-            return {"error": f"Raw socket not available ({exc}) — {hint}"}
+        QMON = QuerierMonitor(iface_ip)   # asks for privileges via system dialog if needed
         return {"ok": True}
     return {"error": "unknown action"}
 
@@ -495,7 +830,9 @@ class Handler(BaseHTTPRequestHandler):
                                  "now": time.time()})
         elif self.path == "/api/querier":
             if QMON:
+                kind, msg = QMON.phase()
                 self._send_json({"running": True, "iface": QMON.iface_ip,
+                                 "phase": kind, "message": msg,
                                  "queriers": QMON.status()})
             else:
                 self._send_json({"running": False, "queriers": []})
@@ -642,7 +979,7 @@ INDEX_HTML = r"""<!doctype html>
     <button class="ghost" id="qBtn">Start analysis</button>
   </div>
   <div class="card">
-    <div id="qBody" class="muted" style="font-family:var(--mono); font-size:13.5px; white-space:pre-wrap; line-height:1.7;">Listens for IGMP queries on the selected interface: querier IP, IGMP version, query interval, MAC + vendor. Requires root/administrator privileges (sudo).</div>
+    <div id="qBody" class="muted" style="font-family:var(--mono); font-size:13.5px; white-space:pre-wrap; line-height:1.7;">Listens for IGMP queries on the selected interface: querier IP, IGMP version, query interval, MAC + vendor. Elevated rights are requested via the system dialog.</div>
   </div>
 
   <div class="toolbar">
@@ -776,7 +1113,7 @@ $("qBtn").onclick = async () => {
   } else {
     const d = await api("/api/querier", {action: "start", iface_ip: $("iface").value});
     if (d.error) { $("qBody").textContent = d.error; return; }
-    $("qBody").textContent = "Waiting for IGMP queries … (general queries typically arrive every 60–125 s)";
+    $("qBody").textContent = "Starting …";
   }
   pollQuerier();
 };
@@ -785,7 +1122,14 @@ async function pollQuerier() {
   const d = await api("/api/querier");
   qRunning = d.running;
   $("qBtn").textContent = qRunning ? "Stop analysis" : "Start analysis";
-  if (!qRunning || !d.queriers.length) return;
+  if (!qRunning) return;
+  if (!d.queriers.length) {
+    const pre = d.phase === "error" ? "Error: " : "";
+    const tail = d.phase === "ok" ? " — waiting for IGMP queries … (general queries typically arrive every 60–125 s)"
+               : d.phase === "error" ? "\nFallback: start the server with sudo / as administrator." : "";
+    $("qBody").textContent = pre + d.message + tail;
+    return;
+  }
   $("qBody").innerHTML = d.queriers.map(q => {
     const iv = [q.qqic ? q.qqic + " s (QQIC)" : null,
                 q.measured ? q.measured.toFixed(1) + " s measured" : null]
@@ -815,6 +1159,9 @@ setInterval(refresh, 1000);
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--querier-helper":
+        run_querier_helper(int(sys.argv[2]), sys.argv[3])   # elevated capture helper
+        return
     ap = argparse.ArgumentParser(description="IGMP Test Tool — multicast subscription GUI")
     ap.add_argument("--port", type=int, default=8688, help="HTTP port for the GUI (default 8688)")
     ap.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
@@ -831,6 +1178,7 @@ def main():
         pass
     finally:
         api_leave_all()
+        QuerierMonitor.shutdown_helper()
         srv.server_close()
 
 

@@ -60,15 +60,29 @@ response time, the querier's MAC address including vendor (OUI lookup online
 via macvendors.com) and — if several queriers are visible — which one wins
 the election (lowest IP).
 
-This requires a raw socket (**root/administrator**):
+Capturing IGMP needs a raw socket, i.e. elevated rights. **You don't have to
+start the app as root/admin** — on "Start analysis" the tool asks through the
+system's own dialog and runs only a small capture helper elevated:
 
-- **Windows**: right-click the exe → *Run as administrator*
-- **macOS**: `sudo "…/IGMP Test Tool.app/Contents/MacOS/IGMP Test Tool"`
-  or `sudo python3 igmp_join_gui.py` / `sudo python3 igmp_join_tool.py`
+| Platform | What you see |
+|---|---|
+| macOS | the standard password prompt ("osascript wants to make changes") |
+| Windows | a UAC prompt (Yes/No) |
+| Linux | the polkit dialog (`pkexec`); without polkit fall back to `sudo` |
+
+The helper is this same script/executable started with `--querier-helper`; it
+streams the parsed queries back to the (unprivileged) app over a loopback TCP
+connection secured with a one-time token, and it exits when the app closes.
+You are asked once per session — stop/start of the analysis re-uses the
+helper. If the app already runs elevated (e.g. `sudo`), no dialog appears.
+
+macOS note: a root process started this way may not read files inside
+`~/Documents`, `~/Desktop`, `~/Downloads` (privacy protection, TCC). If the
+app/script lives there, the tool copies itself to a temp folder for the
+helper automatically; from `/Applications` it runs directly.
 
 General queries typically arrive only every 60–125 s — wait a moment after
-starting the analysis. Joins/statistics keep working without elevated
-privileges.
+starting the analysis. Joins/statistics never need elevated privileges.
 
 ## Notes
 
