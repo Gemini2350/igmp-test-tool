@@ -703,6 +703,101 @@ class QuerierMonitor:
         _STAGED.clear()
 
 
+# ---------------------------------------------------------------- library ---
+#
+# Every successful join is remembered (group, source, port) so it can be
+# re-used later. Stored as JSON in the user's profile; the native app and the
+# web GUI share the same file.
+
+def library_path():
+    if SYSTEM == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support/IGMP Test Tool")
+    elif SYSTEM == "Windows":
+        base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "IGMP Test Tool")
+    else:
+        base = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                            "igmp-test-tool")
+    return os.path.join(base, "library.json")
+
+
+class Library:
+    MAX = 200
+
+    def __init__(self, path=None):
+        self.path = path or library_path()
+        self.lock = threading.Lock()
+        self.items = []
+        self._load()
+
+    @staticmethod
+    def _key(group, source, port):
+        return (group, source or "", int(port) if port else None)
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.items = [i for i in data.get("items", []) if "group" in i]
+        except (OSError, ValueError):
+            self.items = []
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"items": self.items}, f, indent=1)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def _find(self, group, source, port):
+        k = self._key(group, source, port)
+        for i in self.items:
+            if self._key(i["group"], i.get("source"), i.get("port")) == k:
+                return i
+        return None
+
+    def remember(self, group, source, port):
+        with self.lock:
+            self._load()   # pick up changes made by the other variant
+            it = self._find(group, source, port)
+            if it:
+                it["uses"] = it.get("uses", 0) + 1
+            else:
+                it = {"group": group, "source": source or "", "port": int(port) if port else None,
+                      "label": "", "uses": 1}
+                self.items.append(it)
+            it["last_used"] = time.time()
+            self.items.sort(key=lambda i: i.get("last_used", 0), reverse=True)
+            del self.items[self.MAX:]
+            self._save()
+
+    def remove(self, group, source, port):
+        with self.lock:
+            self._load()
+            it = self._find(group, source, port)
+            if it:
+                self.items.remove(it)
+                self._save()
+
+    def set_label(self, group, source, port, label):
+        with self.lock:
+            self._load()
+            it = self._find(group, source, port)
+            if it:
+                it["label"] = (label or "").strip()
+                self._save()
+
+    def list(self):
+        with self.lock:
+            self._load()
+            return [dict(i) for i in self.items]
+
+
+LIBRARY = Library()
+
+
 def fmt_rate(bps):
     if bps >= 1e6:
         return f"{bps / 1e6:.2f} Mbit/s"
@@ -721,7 +816,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("IGMP Test Tool")
-        root.minsize(880, 420)
+        root.minsize(900, 600)
         self.joins = {}       # tree item id -> Join
         self.prev = {}        # tree item id -> (bytes, packets, t)
         self.ifaces = []
@@ -765,6 +860,38 @@ class App:
             "With a UDP port, received packets and bitrate are shown. "
             "Interface list refreshes automatically."
         )).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(0, 6))
+
+        # -- library: previously joined groups/sources, shared with the web GUI
+        lf = ttk.LabelFrame(root, text=" Library — previously joined (double-click to join) ")
+        lf.pack(fill="x", padx=12, pady=(0, 4))
+        lcols = ("label", "group", "source", "port", "last", "uses")
+        self.lib = ttk.Treeview(lf, columns=lcols, show="headings", height=4, selectmode="browse")
+        for c, txt, w, st in (("label", "Label", 150, True), ("group", "Group", 130, False),
+                              ("source", "Source", 130, False), ("port", "Port", 60, False),
+                              ("last", "Last used", 130, False), ("uses", "Uses", 50, False)):
+            self.lib.heading(c, text=txt)
+            self.lib.column(c, width=w, stretch=st, anchor="w")
+        lsb = ttk.Scrollbar(lf, orient="vertical", command=self.lib.yview)
+        self.lib.configure(yscrollcommand=lsb.set)
+        self.lib.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(4, 2))
+        lsb.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=(4, 2))
+        lbar = ttk.Frame(lf)
+        lbar.grid(row=1, column=0, columnspan=2, sticky="we", padx=6, pady=(0, 6))
+        ttk.Button(lbar, text="Join", command=self.lib_join).pack(side="left")
+        ttk.Button(lbar, text="Fill form", command=self.lib_fill).pack(side="left", padx=6)
+        ttk.Label(lbar, text="Label:").pack(side="left", padx=(12, 2))
+        self.e_label = ttk.Entry(lbar, width=18)
+        self.e_label.pack(side="left")
+        ttk.Button(lbar, text="Set", width=4, command=self.lib_set_label).pack(side="left", padx=(3, 0))
+        ttk.Button(lbar, text="Remove", command=self.lib_remove).pack(side="right")
+        self.lib_empty = ttk.Label(lbar, foreground="#777",
+                                   text="Every successful join is remembered here automatically.")
+        self.lib_empty.pack(side="right", padx=8)
+        lf.columnconfigure(0, weight=1)
+        self.lib.bind("<Double-1>", lambda _e: self.lib_join())
+        self.lib.bind("<<TreeviewSelect>>", self._lib_selected)
+        self.lib_items = {}   # tree item id -> library entry
+        self.reload_library()
 
         qf = ttk.LabelFrame(root, text=" Querier analysis ")
         qf.pack(fill="x", padx=12, pady=(0, 4))
@@ -890,6 +1017,69 @@ class App:
         self.joins[item] = j
         self.e_group.delete(0, "end")
         self.e_source.delete(0, "end")
+        LIBRARY.remember(group, source, port)
+        self.reload_library()
+
+    # -- library --------------------------------------------------------------
+
+    def reload_library(self):
+        sel = self._lib_current()
+        self.lib.delete(*self.lib.get_children())
+        self.lib_items.clear()
+        entries = LIBRARY.list()
+        for e in entries:
+            last = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("last_used", 0)))
+            iid = self.lib.insert("", "end", values=(
+                e.get("label") or "", e["group"], e.get("source") or "*",
+                e.get("port") or "—", last, e.get("uses", 1)))
+            self.lib_items[iid] = e
+            if sel and (e["group"], e.get("source") or "", e.get("port")) == sel:
+                self.lib.selection_set(iid)
+        if entries:
+            self.lib_empty.pack_forget()
+        else:
+            self.lib_empty.pack(side="right", padx=8)
+
+    def _lib_current(self):
+        sel = self.lib.selection()
+        if not sel:
+            return None
+        e = self.lib_items.get(sel[0])
+        return (e["group"], e.get("source") or "", e.get("port")) if e else None
+
+    def _lib_selected(self, _e=None):
+        sel = self.lib.selection()
+        if sel and sel[0] in self.lib_items:
+            self.e_label.delete(0, "end")
+            self.e_label.insert(0, self.lib_items[sel[0]].get("label") or "")
+
+    def lib_fill(self):
+        cur = self._lib_current()
+        if not cur:
+            return
+        group, source, port = cur
+        for w, v in ((self.e_group, group), (self.e_source, source),
+                     (self.e_port, port or "")):
+            w.delete(0, "end")
+            w.insert(0, str(v))
+
+    def lib_join(self):
+        if not self._lib_current():
+            return
+        self.lib_fill()
+        self.do_join()
+
+    def lib_set_label(self):
+        cur = self._lib_current()
+        if cur:
+            LIBRARY.set_label(*cur, self.e_label.get())
+            self.reload_library()
+
+    def lib_remove(self):
+        cur = self._lib_current()
+        if cur:
+            LIBRARY.remove(*cur)
+            self.reload_library()
 
     def leave_selected(self):
         sel = self.tree.selection()

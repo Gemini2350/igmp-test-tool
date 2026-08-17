@@ -51,6 +51,23 @@ re-joins automatically once the interface is back. Joins stay active until
 ended via **Leave** / **Leave all** or the tool is closed (IGMP Leave is sent
 cleanly).
 
+## Library
+
+Every successful join (group, source, port) is remembered automatically and
+listed in the **Library** panel: click a row to fill the form, double-click
+(or *Join*) to join it again on the currently selected interface, give
+entries a label (e.g. "Cam 1 video"), or remove them. Sorted by last use,
+up to 200 entries.
+
+The library is a plain JSON file shared by the native app and the web GUI
+(edit or copy it freely):
+
+| Platform | Path |
+|---|---|
+| macOS | `~/Library/Application Support/IGMP Test Tool/library.json` |
+| Windows | `%APPDATA%\IGMP Test Tool\library.json` |
+| Linux | `~/.config/igmp-test-tool/library.json` |
+
 ## Querier analysis
 
 Both variants can analyse the IGMP querier on the network ("Start analysis"

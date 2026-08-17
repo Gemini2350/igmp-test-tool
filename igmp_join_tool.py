@@ -735,6 +735,101 @@ def api_querier(body):
     return {"error": "unknown action"}
 
 
+# ---------------------------------------------------------------- library ---
+#
+# Every successful join is remembered (group, source, port) so it can be
+# re-used later. Stored as JSON in the user's profile; the native app and the
+# web GUI share the same file.
+
+def library_path():
+    if SYSTEM == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support/IGMP Test Tool")
+    elif SYSTEM == "Windows":
+        base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "IGMP Test Tool")
+    else:
+        base = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                            "igmp-test-tool")
+    return os.path.join(base, "library.json")
+
+
+class Library:
+    MAX = 200
+
+    def __init__(self, path=None):
+        self.path = path or library_path()
+        self.lock = threading.Lock()
+        self.items = []
+        self._load()
+
+    @staticmethod
+    def _key(group, source, port):
+        return (group, source or "", int(port) if port else None)
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.items = [i for i in data.get("items", []) if "group" in i]
+        except (OSError, ValueError):
+            self.items = []
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"items": self.items}, f, indent=1)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def _find(self, group, source, port):
+        k = self._key(group, source, port)
+        for i in self.items:
+            if self._key(i["group"], i.get("source"), i.get("port")) == k:
+                return i
+        return None
+
+    def remember(self, group, source, port):
+        with self.lock:
+            self._load()   # pick up changes made by the other variant
+            it = self._find(group, source, port)
+            if it:
+                it["uses"] = it.get("uses", 0) + 1
+            else:
+                it = {"group": group, "source": source or "", "port": int(port) if port else None,
+                      "label": "", "uses": 1}
+                self.items.append(it)
+            it["last_used"] = time.time()
+            self.items.sort(key=lambda i: i.get("last_used", 0), reverse=True)
+            del self.items[self.MAX:]
+            self._save()
+
+    def remove(self, group, source, port):
+        with self.lock:
+            self._load()
+            it = self._find(group, source, port)
+            if it:
+                self.items.remove(it)
+                self._save()
+
+    def set_label(self, group, source, port, label):
+        with self.lock:
+            self._load()
+            it = self._find(group, source, port)
+            if it:
+                it["label"] = (label or "").strip()
+                self._save()
+
+    def list(self):
+        with self.lock:
+            self._load()
+            return [dict(i) for i in self.items]
+
+
+LIBRARY = Library()
+
+
 JOINS = {}
 JOINS_LOCK = threading.Lock()
 
@@ -780,7 +875,20 @@ def api_join(body):
         except OSError as exc:
             return {"error": f"Join failed: {exc}"}
         JOINS[j.id] = j
+    LIBRARY.remember(group, source, port)
     return {"ok": True, "join": j.to_dict()}
+
+
+def api_library(body):
+    action = body.get("action")
+    group, source, port = body.get("group"), body.get("source") or "", body.get("port")
+    if action == "remove":
+        LIBRARY.remove(group, source, port)
+    elif action == "label":
+        LIBRARY.set_label(group, source, port, body.get("label", ""))
+    else:
+        return {"error": "unknown action"}
+    return {"ok": True, "items": LIBRARY.list()}
 
 
 def api_leave(body):
@@ -828,6 +936,8 @@ class Handler(BaseHTTPRequestHandler):
             with JOINS_LOCK:
                 self._send_json({"joins": [j.to_dict() for j in JOINS.values()],
                                  "now": time.time()})
+        elif self.path == "/api/library":
+            self._send_json({"items": LIBRARY.list(), "path": LIBRARY.path})
         elif self.path == "/api/querier":
             if QMON:
                 kind, msg = QMON.phase()
@@ -854,6 +964,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(api_leave_all())
         elif self.path == "/api/querier":
             self._send_json(api_querier(body))
+        elif self.path == "/api/library":
+            self._send_json(api_library(body))
         else:
             self.send_error(404)
 
@@ -938,6 +1050,10 @@ INDEX_HTML = r"""<!doctype html>
     background: rgba(229, 83, 75, .08);
   }
   .empty { color: var(--muted); text-align: center; padding: 28px 0; font-size: 14px; }
+  tr.lib { cursor: pointer; }
+  tr.lib:hover td { background: var(--panel2); }
+  button.mini { padding: 4px 10px; font-size: 12.5px; font-weight: 600; }
+  .lbl { color: var(--text); font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
   .hint { color: var(--muted); font-size: 12.5px; margin: 14px 2px 0; }
 </style>
 </head>
@@ -972,6 +1088,20 @@ INDEX_HTML = r"""<!doctype html>
     <div id="msg"></div>
     <p class="hint">Without a source an ASM join (IGMPv2/v3) is sent, with a source an SSM join (IGMPv3, INCLUDE).
     With a port the tool counts received packets and shows the bitrate — without a port only the membership is held. The interface list refreshes automatically.</p>
+  </div>
+
+  <div class="toolbar">
+    <h2>Library — previously joined</h2>
+    <span class="muted" style="font-size:12.5px">click a row to fill the form · double-click to join</span>
+  </div>
+  <div class="card" style="padding: 6px 8px;">
+    <table>
+      <thead>
+        <tr><th>Label</th><th>Group</th><th>Source</th><th>Port</th><th>Last used</th><th>Uses</th><th></th></tr>
+      </thead>
+      <tbody id="libRows"></tbody>
+    </table>
+    <div class="empty" id="libEmpty">Every successful join is remembered here automatically.</div>
   </div>
 
   <div class="toolbar">
@@ -1101,8 +1231,49 @@ $("joinBtn").onclick = async () => {
   });
   if (d.error) { showErr(d.error); return; }
   $("group").value = ""; $("source").value = "";
-  refresh();
+  refresh(); loadLibrary();
 };
+
+function fmtDate(t) {
+  const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fillForm(e) {
+  $("group").value = e.group; $("source").value = e.source || ""; $("port").value = e.port || "";
+}
+async function libAction(action, e, extra) {
+  const d = await api("/api/library", Object.assign({action, group: e.group, source: e.source, port: e.port}, extra || {}));
+  if (d.items) renderLibrary(d.items);
+}
+function renderLibrary(items) {
+  const rows = $("libRows"); rows.innerHTML = "";
+  $("libEmpty").style.display = items.length ? "none" : "block";
+  for (const e of items) {
+    const tr = document.createElement("tr"); tr.className = "lib";
+    tr.innerHTML = `
+      <td class="lbl">${e.label ? escapeHtml(e.label) : '<span class="muted">—</span>'}</td>
+      <td>${e.group}</td>
+      <td>${e.source || '<span class="muted">*</span>'}</td>
+      <td>${e.port || '<span class="muted">—</span>'}</td>
+      <td class="muted">${fmtDate(e.last_used || 0)}</td>
+      <td class="muted">${e.uses || 1}</td>
+      <td style="white-space:nowrap;text-align:right"></td>`;
+    tr.onclick = () => fillForm(e);
+    tr.ondblclick = () => { fillForm(e); $("joinBtn").click(); };
+    const cell = tr.lastElementChild;
+    const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = cls;
+      b.textContent = txt; b.onclick = ev => { ev.stopPropagation(); fn(); }; cell.appendChild(b); return b; };
+    mk("Join", "mini", () => { fillForm(e); $("joinBtn").click(); }).style.marginRight = "6px";
+    mk("Label", "ghost mini", () => { const l = prompt("Label for " + e.group + (e.source ? " / " + e.source : ""), e.label || "");
+      if (l !== null) libAction("label", e, {label: l}); }).style.marginRight = "6px";
+    mk("Remove", "leave mini", () => libAction("remove", e));
+    rows.appendChild(tr);
+  }
+}
+function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+async function loadLibrary() { const d = await api("/api/library"); renderLibrary(d.items || []); }
+loadLibrary();
+setInterval(loadLibrary, 10000);  // picks up changes made in the native app
 $("leaveAll").onclick = async () => { await api("/api/leave_all"); refresh(); };
 
 let qRunning = false;
