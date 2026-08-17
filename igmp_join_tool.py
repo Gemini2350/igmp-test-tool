@@ -389,13 +389,13 @@ def api_querier(body):
         try:
             ipaddress.ip_address(iface_ip)
         except ValueError:
-            return {"error": "Bitte ein Interface auswählen"}
+            return {"error": "Please select an interface"}
         try:
             QMON = QuerierMonitor(iface_ip)
         except OSError as exc:
-            hint = ("bitte als Administrator ausführen" if SYSTEM == "Windows"
-                    else "bitte mit sudo starten: sudo python3 igmp_join_tool.py")
-            return {"error": f"Raw-Socket nicht möglich ({exc}) — {hint}"}
+            hint = ("please run as administrator" if SYSTEM == "Windows"
+                    else "please start with sudo: sudo python3 igmp_join_tool.py")
+            return {"error": f"Raw socket not available ({exc}) — {hint}"}
         return {"ok": True}
     return {"error": "unknown action"}
 
@@ -413,20 +413,20 @@ def api_join(body):
 
     try:
         if not ipaddress.ip_address(group).is_multicast:
-            return {"error": f"{group} ist keine Multicast-Adresse (224.0.0.0/4)"}
+            return {"error": f"{group} is not a multicast address (224.0.0.0/4)"}
     except ValueError:
-        return {"error": f"Ungültige Multicast-Adresse: {group!r}"}
+        return {"error": f"Invalid multicast address: {group!r}"}
     if source:
         try:
             src = ipaddress.ip_address(source)
             if src.is_multicast:
-                return {"error": "SSM-Source muss eine Unicast-Adresse sein"}
+                return {"error": "SSM source must be a unicast address"}
         except ValueError:
-            return {"error": f"Ungültige Source-Adresse: {source!r}"}
+            return {"error": f"Invalid source address: {source!r}"}
     try:
         ipaddress.ip_address(iface_ip)
     except ValueError:
-        return {"error": "Bitte ein Interface auswählen"}
+        return {"error": "Please select an interface"}
     port = None
     if port_raw not in (None, ""):
         try:
@@ -434,16 +434,16 @@ def api_join(body):
             if not 1 <= port <= 65535:
                 raise ValueError
         except (TypeError, ValueError):
-            return {"error": f"Ungültiger Port: {port_raw!r}"}
+            return {"error": f"Invalid port: {port_raw!r}"}
 
     with JOINS_LOCK:
         for j in JOINS.values():
             if (j.group, j.source or "", j.iface_ip) == (group, source, iface_ip):
-                return {"error": "Dieser Join ist bereits aktiv"}
+                return {"error": "This join is already active"}
         try:
             j = Join(group, source, iface_ip, iface_name, port)
         except OSError as exc:
-            return {"error": f"Join fehlgeschlagen: {exc}"}
+            return {"error": f"Join failed: {exc}"}
         JOINS[j.id] = j
     return {"ok": True, "join": j.to_dict()}
 
@@ -455,7 +455,7 @@ def api_leave(body):
     if j:
         j.leave()
         return {"ok": True}
-    return {"error": "Join nicht gefunden"}
+    return {"error": "Join not found"}
 
 
 def api_leave_all():
@@ -522,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 INDEX_HTML = r"""<!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -613,19 +613,19 @@ INDEX_HTML = r"""<!doctype html>
   <div class="card">
     <div class="grid">
       <div>
-        <label><b>Multicast-Gruppe</b> *</label>
+        <label><b>Multicast group</b> *</label>
         <input id="group" placeholder="239.1.1.1" spellcheck="false">
       </div>
       <div>
         <label><b>Source</b> (optional, SSM)</label>
-        <input id="source" placeholder="z.B. 192.168.10.5" spellcheck="false">
+        <input id="source" placeholder="e.g. 192.168.10.5" spellcheck="false">
       </div>
       <div>
-        <label><b>Interface</b> *</label>
+        <label><b>Interface</b> * <a href="#" id="ifRefresh" title="Refresh interface list" style="color:var(--accent);text-decoration:none;margin-left:6px">⟳ refresh</a></label>
         <select id="iface"></select>
       </div>
       <div>
-        <label><b>UDP-Port</b> (optional)</label>
+        <label><b>UDP port</b> (optional)</label>
         <input id="port" placeholder="5004" inputmode="numeric" spellcheck="false">
       </div>
       <div>
@@ -633,31 +633,31 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <div id="msg"></div>
-    <p class="hint">Ohne Source wird ein ASM-Join (IGMPv2/v3) gesendet, mit Source ein SSM-Join (IGMPv3, INCLUDE).
-    Mit Port zählt das Tool empfangene Pakete und zeigt die Bitrate an — ohne Port wird nur der Join gehalten.</p>
+    <p class="hint">Without a source an ASM join (IGMPv2/v3) is sent, with a source an SSM join (IGMPv3, INCLUDE).
+    With a port the tool counts received packets and shows the bitrate — without a port only the membership is held. The interface list refreshes automatically.</p>
   </div>
 
   <div class="toolbar">
-    <h2>Querier-Analyse</h2>
-    <button class="ghost" id="qBtn">Analyse starten</button>
+    <h2>Querier analysis</h2>
+    <button class="ghost" id="qBtn">Start analysis</button>
   </div>
   <div class="card">
-    <div id="qBody" class="muted" style="font-family:var(--mono); font-size:13.5px; white-space:pre-wrap; line-height:1.7;">Lauscht auf IGMP-Queries des gewählten Interfaces: Querier-IP, Version, Query-Intervall, MAC + Hersteller. Benötigt Root-/Administratorrechte (sudo).</div>
+    <div id="qBody" class="muted" style="font-family:var(--mono); font-size:13.5px; white-space:pre-wrap; line-height:1.7;">Listens for IGMP queries on the selected interface: querier IP, IGMP version, query interval, MAC + vendor. Requires root/administrator privileges (sudo).</div>
   </div>
 
   <div class="toolbar">
-    <h2>Aktive Joins</h2>
-    <button class="ghost" id="leaveAll">Alle verlassen</button>
+    <h2>Active joins</h2>
+    <button class="ghost" id="leaveAll">Leave all</button>
   </div>
   <div class="card" style="padding: 6px 8px;">
     <table>
       <thead>
-        <tr><th></th><th>Gruppe</th><th>Source</th><th>Interface</th><th>Port</th>
-            <th>Pakete</th><th>Bitrate</th><th>Uptime</th><th></th></tr>
+        <tr><th></th><th>Group</th><th>Source</th><th>Interface</th><th>Port</th>
+            <th>Packets</th><th>Bitrate</th><th>Uptime</th><th></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
-    <div class="empty" id="empty">Keine aktiven Joins</div>
+    <div class="empty" id="empty">No active joins</div>
   </div>
 </main>
 <script>
@@ -675,10 +675,15 @@ function showErr(text) {
   m.textContent = text; m.style.display = text ? "block" : "none";
 }
 
+let ifaceKey = "";
 async function loadInterfaces() {
   const d = await api("/api/interfaces");
   $("sys").textContent = d.system;
   const sel = $("iface");
+  const key = JSON.stringify(d.interfaces);
+  // untouched if nothing changed, or while the user has the dropdown open
+  if (key === ifaceKey || (sel.options.length && document.activeElement === sel)) return;
+  ifaceKey = key;
   const cur = sel.value;
   sel.innerHTML = "";
   for (const i of d.interfaces) {
@@ -688,8 +693,16 @@ async function loadInterfaces() {
     o.textContent = `${i.name} — ${i.ip}`;
     sel.appendChild(o);
   }
-  if (cur) sel.value = cur;
+  if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
 }
+$("ifRefresh").onclick = async e => {
+  e.preventDefault();
+  const a = $("ifRefresh"); a.textContent = "⟳ loading …";
+  ifaceKey = "";  // force rebuild
+  await loadInterfaces();
+  a.textContent = "⟳ refresh";
+};
+setInterval(loadInterfaces, 5000);  // keeps the list current (e.g. USB adapter plugged in)
 
 function fmtRate(bps) {
   if (bps >= 1e6) return (bps / 1e6).toFixed(2) + " Mbit/s";
@@ -717,7 +730,7 @@ async function refresh() {
     }
     nprev[j.id] = {bytes: j.bytes, packets: j.packets, t: d.now};
     const tr = document.createElement("tr");
-    const rateCell = j.error ? '<span class="errtext">unterbrochen</span>'
+    const rateCell = j.error ? '<span class="errtext">interrupted</span>'
       : rate === null ? '<span class="muted">—</span>'
       : '<span class="rate">' + fmtRate(rate) + "</span>";
     tr.innerHTML = `
@@ -759,11 +772,11 @@ let qRunning = false;
 $("qBtn").onclick = async () => {
   if (qRunning) {
     await api("/api/querier", {action: "stop"});
-    $("qBody").textContent = "Analyse gestoppt.";
+    $("qBody").textContent = "Analysis stopped.";
   } else {
     const d = await api("/api/querier", {action: "start", iface_ip: $("iface").value});
     if (d.error) { $("qBody").textContent = d.error; return; }
-    $("qBody").textContent = "Warte auf IGMP-Queries … (General Queries kommen typischerweise alle 60–125 s)";
+    $("qBody").textContent = "Waiting for IGMP queries … (general queries typically arrive every 60–125 s)";
   }
   pollQuerier();
 };
@@ -771,19 +784,19 @@ $("qBtn").onclick = async () => {
 async function pollQuerier() {
   const d = await api("/api/querier");
   qRunning = d.running;
-  $("qBtn").textContent = qRunning ? "Analyse stoppen" : "Analyse starten";
+  $("qBtn").textContent = qRunning ? "Stop analysis" : "Start analysis";
   if (!qRunning || !d.queriers.length) return;
   $("qBody").innerHTML = d.queriers.map(q => {
     const iv = [q.qqic ? q.qqic + " s (QQIC)" : null,
-                q.measured ? q.measured.toFixed(1) + " s gemessen" : null]
-               .filter(Boolean).join(" / ") || "noch unbekannt";
+                q.measured ? q.measured.toFixed(1) + " s measured" : null]
+               .filter(Boolean).join(" / ") || "not yet known";
     let mac;
-    if (q.ip === "0.0.0.0") mac = "nicht ermittelbar (Proxy-Query mit Source 0.0.0.0)";
-    else if (q.mac) mac = `${q.mac} — ${q.vendor || "Hersteller nicht auflösbar"}`;
-    else mac = "wird ermittelt …";
-    const el = q.elected && d.queriers.length > 1 ? ' <span class="rate">← aktiv (niedrigste IP)</span>' : "";
+    if (q.ip === "0.0.0.0") mac = "not resolvable (proxy query with source 0.0.0.0)";
+    else if (q.mac) mac = `${q.mac} — ${q.vendor || "vendor not resolvable"}`;
+    else mac = "resolving …";
+    const el = q.elected && d.queriers.length > 1 ? ' <span class="rate">← active (lowest IP)</span>' : "";
     return `<b style="color:var(--text)">Querier ${q.ip}</b>  (IGMPv${q.version})${el}
-  Query-Intervall: ${iv} · Max Resp: ${q.max_resp.toFixed(1)} s · zuletzt vor ${q.ago.toFixed(0)} s
+  Query interval: ${iv} · Max Resp: ${q.max_resp.toFixed(1)} s · last seen ${q.ago.toFixed(0)} s ago
   MAC: ${mac}`;
   }).join("\n\n");
 }
@@ -809,7 +822,7 @@ def main():
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"IGMP Test Tool läuft auf {url}  (Ctrl+C zum Beenden)")
+    print(f"IGMP Test Tool running at {url}  (Ctrl+C to quit)")
     if not args.no_browser:
         threading.Timer(0.4, webbrowser.open, [url]).start()
     try:

@@ -387,28 +387,34 @@ class App:
         self.joins = {}       # tree item id -> Join
         self.prev = {}        # tree item id -> (bytes, packets, t)
         self.ifaces = []
+        self._iface_scan = None   # result of background interface scan
 
         pad = {"padx": 6, "pady": 4}
-        form = ttk.LabelFrame(root, text=" Neuer Join ")
+        form = ttk.LabelFrame(root, text=" New join ")
         form.pack(fill="x", padx=12, pady=(12, 6))
 
-        ttk.Label(form, text="Multicast-Gruppe *").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(form, text="Multicast group *").grid(row=0, column=0, sticky="w", **pad)
         ttk.Label(form, text="Source (optional, SSM)").grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(form, text="Interface *").grid(row=0, column=2, sticky="w", **pad)
-        ttk.Label(form, text="UDP-Port (optional)").grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(form, text="UDP port (optional)").grid(row=0, column=3, sticky="w", **pad)
 
         self.e_group = ttk.Entry(form, width=18)
         self.e_group.grid(row=1, column=0, sticky="we", **pad)
         self.e_source = ttk.Entry(form, width=18)
         self.e_source.grid(row=1, column=1, sticky="we", **pad)
-        self.c_iface = ttk.Combobox(form, state="readonly", width=28)
-        self.c_iface.grid(row=1, column=2, sticky="we", **pad)
+        # interface dropdown with a compact refresh button glued to its right;
+        # the list also refreshes itself in the background every few seconds
+        ifrow = ttk.Frame(form)
+        ifrow.grid(row=1, column=2, sticky="we", **pad)
+        ifrow.columnconfigure(0, weight=1)
+        self.c_iface = ttk.Combobox(ifrow, state="readonly", width=26)
+        self.c_iface.grid(row=0, column=0, sticky="we")
+        ttk.Button(ifrow, text="⟳", width=2, command=self.load_interfaces)\
+            .grid(row=0, column=1, padx=(3, 0))
         self.e_port = ttk.Entry(form, width=10)
         self.e_port.grid(row=1, column=3, sticky="we", **pad)
         btn = ttk.Button(form, text="Join", command=self.do_join, default="active")
         btn.grid(row=1, column=4, sticky="we", **pad)
-        ttk.Button(form, text="⟳", width=3, command=self.load_interfaces)\
-            .grid(row=1, column=5, sticky="w", padx=(0, 6))
 
         for col in range(3):
             form.columnconfigure(col, weight=1)
@@ -417,34 +423,35 @@ class App:
         self.lbl_err = ttk.Label(form, textvariable=self.err, foreground="#c62828")
         self.lbl_err.grid(row=2, column=0, columnspan=6, sticky="w", padx=6)
         ttk.Label(form, foreground="#777", text=(
-            "Ohne Source: ASM-Join (IGMPv2/v3) · mit Source: SSM-Join (IGMPv3). "
-            "Mit UDP-Port werden empfangene Pakete und Bitrate angezeigt."
+            "Without source: ASM join (IGMPv2/v3) · with source: SSM join (IGMPv3). "
+            "With a UDP port, received packets and bitrate are shown. "
+            "Interface list refreshes automatically."
         )).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(0, 6))
 
-        qf = ttk.LabelFrame(root, text=" Querier-Analyse ")
+        qf = ttk.LabelFrame(root, text=" Querier analysis ")
         qf.pack(fill="x", padx=12, pady=(0, 4))
         qtop = ttk.Frame(qf)
         qtop.pack(fill="x", padx=6, pady=(4, 0))
-        self.q_btn = ttk.Button(qtop, text="Analyse starten", command=self.toggle_querier)
+        self.q_btn = ttk.Button(qtop, text="Start analysis", command=self.toggle_querier)
         self.q_btn.pack(side="left")
         self.qmon = None
         self.q_text = tk.StringVar(value=(
-            "Lauscht auf IGMP-Queries des gewählten Interfaces: Querier-IP, Version, "
-            "Query-Intervall, MAC + Hersteller. Benötigt Root-/Administratorrechte."))
+            "Listens for IGMP queries on the selected interface: querier IP, IGMP version, "
+            "query interval, MAC + vendor. Requires root/administrator privileges."))
         ttk.Label(qf, textvariable=self.q_text, justify="left",
                   font=("Courier" if SYSTEM == "Windows" else "Menlo", 12)
                   ).pack(fill="x", padx=8, pady=(4, 8))
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=12, pady=(6, 0))
-        ttk.Label(bar, text="Aktive Joins").pack(side="left")
-        ttk.Button(bar, text="Alle verlassen", command=self.leave_all).pack(side="right")
-        ttk.Button(bar, text="Leave (Auswahl)", command=self.leave_selected).pack(side="right", padx=6)
+        ttk.Label(bar, text="Active joins").pack(side="left")
+        ttk.Button(bar, text="Leave all", command=self.leave_all).pack(side="right")
+        ttk.Button(bar, text="Leave selected", command=self.leave_selected).pack(side="right", padx=6)
 
         cols = ("rx", "group", "source", "iface", "port", "pkts", "rate", "up")
         self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
-        headings = {"rx": "", "group": "Gruppe", "source": "Source", "iface": "Interface",
-                    "port": "Port", "pkts": "Pakete", "rate": "Bitrate", "up": "Uptime"}
+        headings = {"rx": "", "group": "Group", "source": "Source", "iface": "Interface",
+                    "port": "Port", "pkts": "Packets", "rate": "Bitrate", "up": "Uptime"}
         widths = {"rx": 30, "group": 130, "source": 130, "iface": 190,
                   "port": 60, "pkts": 90, "rate": 110, "up": 80}
         for c in cols:
@@ -462,13 +469,38 @@ class App:
             w.bind("<Return>", lambda _e: self.do_join())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(1000, self.tick)
+        threading.Thread(target=self._iface_scan_loop, daemon=True).start()
+
+    # -- interfaces -----------------------------------------------------------
+
+    def _apply_interfaces(self, ifaces):
+        cur = self.c_iface.get()
+        self.ifaces = ifaces
+        vals = [f"{n} — {ip}" for n, ip in ifaces]
+        self.c_iface["values"] = vals
+        if cur in vals:
+            self.c_iface.set(cur)       # keep selection if still present
+        elif vals:
+            self.c_iface.current(0)     # otherwise fall back to first
+        else:
+            self.c_iface.set("")
 
     def load_interfaces(self):
-        self.ifaces = list_interfaces()
-        vals = [f"{n} — {ip}" for n, ip in self.ifaces]
-        self.c_iface["values"] = vals
-        if vals and not self.c_iface.get():
-            self.c_iface.current(0)
+        """Explicit refresh (button / startup): synchronous."""
+        self._apply_interfaces(list_interfaces())
+
+    def _iface_scan_loop(self):
+        """Background scan every 5 s; UI is only touched when the list changed."""
+        while True:
+            time.sleep(5)
+            try:
+                found = list_interfaces()
+            except Exception:  # noqa: BLE001
+                continue
+            if found != self.ifaces:
+                self.root.after(0, self._apply_interfaces, found)
+
+    # -- joins ----------------------------------------------------------------
 
     def do_join(self):
         self.err.set("")
@@ -479,21 +511,21 @@ class App:
 
         try:
             if not ipaddress.ip_address(group).is_multicast:
-                self.err.set(f"{group} ist keine Multicast-Adresse (224.0.0.0/4)")
+                self.err.set(f"{group} is not a multicast address (224.0.0.0/4)")
                 return
         except ValueError:
-            self.err.set(f"Ungültige Multicast-Adresse: {group!r}")
+            self.err.set(f"Invalid multicast address: {group!r}")
             return
         if source:
             try:
                 if ipaddress.ip_address(source).is_multicast:
-                    self.err.set("SSM-Source muss eine Unicast-Adresse sein")
+                    self.err.set("SSM source must be a unicast address")
                     return
             except ValueError:
-                self.err.set(f"Ungültige Source-Adresse: {source!r}")
+                self.err.set(f"Invalid source address: {source!r}")
                 return
         if idx < 0 or idx >= len(self.ifaces):
-            self.err.set("Bitte ein Interface auswählen")
+            self.err.set("Please select an interface")
             return
         iface_name, iface_ip = self.ifaces[idx]
         port = None
@@ -503,16 +535,16 @@ class App:
                 if not 1 <= port <= 65535:
                     raise ValueError
             except ValueError:
-                self.err.set(f"Ungültiger Port: {port_raw!r}")
+                self.err.set(f"Invalid port: {port_raw!r}")
                 return
         for j in self.joins.values():
             if (j.group, j.source or "", j.iface_ip) == (group, source, iface_ip):
-                self.err.set("Dieser Join ist bereits aktiv")
+                self.err.set("This join is already active")
                 return
         try:
             j = Join(group, source, iface_ip, iface_name, port)
         except OSError as exc:
-            self.err.set(f"Join fehlgeschlagen: {exc}")
+            self.err.set(f"Join failed: {exc}")
             return
         item = self.tree.insert("", "end", values=(
             "●", group, source or "*", f"{iface_name} ({iface_ip})",
@@ -520,57 +552,6 @@ class App:
         self.joins[item] = j
         self.e_group.delete(0, "end")
         self.e_source.delete(0, "end")
-
-    def toggle_querier(self):
-        if self.qmon:
-            self.qmon.stop()
-            self.qmon = None
-            self.q_btn.configure(text="Analyse starten")
-            self.q_text.set("Analyse gestoppt.")
-            return
-        idx = self.c_iface.current()
-        if idx < 0 or idx >= len(self.ifaces):
-            self.q_text.set("Bitte ein Interface auswählen.")
-            return
-        _name, ip = self.ifaces[idx]
-        try:
-            self.qmon = QuerierMonitor(ip)
-        except OSError:
-            if SYSTEM == "Windows":
-                self.q_text.set("Zugriff verweigert — bitte die App per Rechtsklick → "
-                                "'Als Administrator ausführen' starten.")
-            else:
-                self.q_text.set("Zugriff verweigert — Raw-Socket benötigt Root. Im Terminal:\n"
-                                "sudo \"…/IGMP Test Tool.app/Contents/MacOS/IGMP Test Tool\"  "
-                                "bzw.  sudo python3 igmp_join_gui.py")
-            return
-        self.q_btn.configure(text="Analyse stoppen")
-        self.q_text.set("Warte auf IGMP-Queries … "
-                        "(General Queries kommen typischerweise alle 60–125 s)")
-
-    @staticmethod
-    def _format_queriers(qs):
-        lines = []
-        for q in qs:
-            head = f"Querier {q['ip']}  (IGMPv{q['version']})"
-            if q.get("elected") and len(qs) > 1:
-                head += "  ← aktiv (niedrigste IP gewinnt die Wahl)"
-            iv = []
-            if q.get("qqic"):
-                iv.append(f"{q['qqic']} s (QQIC)")
-            if q.get("measured"):
-                iv.append(f"{q['measured']:.1f} s gemessen")
-            lines.append(head)
-            lines.append(f"  Query-Intervall: {' / '.join(iv) if iv else 'noch unbekannt'}"
-                         f" · Max Resp: {q['max_resp']:.1f} s · zuletzt vor {q['ago']:.0f} s")
-            if q["ip"] == "0.0.0.0":
-                mac_s = "nicht ermittelbar (Proxy-Query mit Source 0.0.0.0)"
-            elif q.get("mac"):
-                mac_s = f"{q['mac']} — {q.get('vendor') or 'Hersteller nicht auflösbar'}"
-            else:
-                mac_s = "wird ermittelt …"
-            lines.append(f"  MAC: {mac_s}")
-        return "\n".join(lines)
 
     def leave_selected(self):
         sel = self.tree.selection()
@@ -588,13 +569,68 @@ class App:
         self.joins.clear()
         self.prev.clear()
 
+    # -- querier --------------------------------------------------------------
+
+    def toggle_querier(self):
+        if self.qmon:
+            self.qmon.stop()
+            self.qmon = None
+            self.q_btn.configure(text="Start analysis")
+            self.q_text.set("Analysis stopped.")
+            return
+        idx = self.c_iface.current()
+        if idx < 0 or idx >= len(self.ifaces):
+            self.q_text.set("Please select an interface.")
+            return
+        _name, ip = self.ifaces[idx]
+        try:
+            self.qmon = QuerierMonitor(ip)
+        except OSError:
+            if SYSTEM == "Windows":
+                self.q_text.set("Access denied — please right-click the app and choose "
+                                "'Run as administrator'.")
+            else:
+                self.q_text.set("Access denied — raw socket requires root. In a terminal:\n"
+                                "sudo \"…/IGMP Test Tool.app/Contents/MacOS/IGMP Test Tool\"  "
+                                "or  sudo python3 igmp_join_gui.py")
+            return
+        self.q_btn.configure(text="Stop analysis")
+        self.q_text.set("Waiting for IGMP queries … "
+                        "(general queries typically arrive every 60–125 s)")
+
+    @staticmethod
+    def _format_queriers(qs):
+        lines = []
+        for q in qs:
+            head = f"Querier {q['ip']}  (IGMPv{q['version']})"
+            if q.get("elected") and len(qs) > 1:
+                head += "  ← active (lowest IP wins the election)"
+            iv = []
+            if q.get("qqic"):
+                iv.append(f"{q['qqic']} s (QQIC)")
+            if q.get("measured"):
+                iv.append(f"{q['measured']:.1f} s measured")
+            lines.append(head)
+            lines.append(f"  Query interval: {' / '.join(iv) if iv else 'not yet known'}"
+                         f" · Max Resp: {q['max_resp']:.1f} s · last seen {q['ago']:.0f} s ago")
+            if q["ip"] == "0.0.0.0":
+                mac_s = "not resolvable (proxy query with source 0.0.0.0)"
+            elif q.get("mac"):
+                mac_s = f"{q['mac']} — {q.get('vendor') or 'vendor not resolvable'}"
+            else:
+                mac_s = "resolving …"
+            lines.append(f"  MAC: {mac_s}")
+        return "\n".join(lines)
+
+    # -- periodic UI update ---------------------------------------------------
+
     def tick(self):
         try:
             now = time.time()
             for item, j in self.joins.items():
                 rate_s, pkts_s, rx = "—", "—", False
                 if j.port:
-                    pkts_s = f"{j.packets:,}".replace(",", "'")
+                    pkts_s = f"{j.packets:,}"
                     p = self.prev.get(item)
                     if p:
                         dt = now - p[2]
@@ -603,7 +639,7 @@ class App:
                         rx = j.packets > p[1]
                     self.prev[item] = (j.bytes, j.packets, now)
                 if j.error:
-                    tag, rate_s = "err", "unterbrochen"
+                    tag, rate_s = "err", "interrupted"
                 else:
                     tag = "rx" if rx else "idle"
                 self.tree.item(item, values=(
