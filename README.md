@@ -43,13 +43,30 @@ Options: `--port <n>` (GUI port), `--no-browser`.
 | Multicast group | Required, e.g. `239.1.1.1` |
 | Source | Optional — with a source an SSM join (IGMPv3, INCLUDE mode) is sent, without one an ASM join |
 | Interface | Interface the IGMP report is sent on. The list refreshes automatically (e.g. when a USB adapter is plugged in); ⟳ forces an immediate refresh |
-| UDP port | Needed for packet statistics: with a port the tool counts received packets and shows the bitrate (e.g. `5004` for ST 2110/AES67, `2467` for Q-SYS discovery); without a port only the membership is held and the row shows "set port to count" |
+| UDP port | Needed for packet statistics: with a port the tool counts received packets and shows the bitrate (e.g. `5004` for ST 2110/AES67, `2467` for Q-SYS discovery). Leave it empty to **auto-detect** the port (see below) |
 
 The green dot pulses while packets are arriving. If the interface goes down
 under an active join, the row turns red ("interrupted") and the tool
 re-joins automatically once the interface is back. Joins stay active until
 ended via **Leave** / **Leave all** or the tool is closed (IGMP Leave is sent
 cleanly).
+
+## Port auto-detection
+
+If you join without a port, the tool finds it for you in two stages:
+
+1. **Well-known ports, no privileges:** for ~20 s it listens on a list of
+   common multicast ports (RTP 5004/5005, PTP 319/320, Q-SYS 2467, Dante 4321,
+   SAP 9875, VLC 1234, ...). Traffic on one of them adopts that port
+   automatically; the row then shows e.g. `2467 (auto)`.
+2. **Any port, exact:** **Detect port** captures the UDP traffic to the group
+   and takes the destination port it sees. This needs elevated rights and uses
+   the same helper/system dialog as the querier analysis (once per session).
+   Once the helper is authorized, further port-less joins are sniffed
+   automatically.
+
+Joining the same group again *with* a port simply sets that port on the
+existing join. Detected ports are written back to the library entry.
 
 ## Library
 

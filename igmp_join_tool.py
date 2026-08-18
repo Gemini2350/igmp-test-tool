@@ -94,6 +94,17 @@ def list_interfaces():
     return ifaces
 
 
+# Ports tried when a join is made without a port ("auto-detect"). Always-on
+# discovery ports (mDNS 5353, SSDP 1900, WS-Discovery 3702) are left out on
+# purpose: their traffic would be attributed to any group.
+WELL_KNOWN_PORTS = [5004, 5005, 5006, 5008, 5010, 5012, 5020, 5030, 5040, 5050,
+                    5000, 5001, 5002, 5003, 5100, 5200, 319, 320, 2467, 4321,
+                    9875, 1234, 1235, 1236, 4000, 4001, 5555, 6000, 8000, 8001,
+                    9000, 9001, 9002, 10000, 20000, 30000, 50000, 50004, 50020,
+                    14336]
+PROBE_SECONDS = 20
+
+
 class Join:
     _next_id = 1
     _id_lock = threading.Lock()
@@ -113,43 +124,142 @@ class Join:
         self.rx_error = False
         self._stop = threading.Event()
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.detect = None        # port auto-detection state (only when no port given)
+        self.port_auto = None     # "probe" | "sniff" when the port was detected
+        self.detector = None
+        self._probes = []
+        self.sock = self._make_socket(self.port or 0)
+        if self.port:
+            self.sock.settimeout(0.5)
+            threading.Thread(target=self._recv_loop, daemon=True).start()
+        else:
+            self._start_probe()
+
+    def _make_socket(self, port):
+        """UDP socket bound to the port with the group membership added."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             try:
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
                 pass
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except OSError:
             pass
-
-        bind_port = self.port or 0
         if SYSTEM == "Windows":
-            self.sock.bind(("", bind_port))
+            sock.bind(("", port))
         else:
             # binding to the group filters out unrelated traffic on the port
             try:
-                self.sock.bind((group, bind_port))
+                sock.bind((self.group, port))
             except OSError:
-                self.sock.bind(("", bind_port))
-
+                sock.bind(("", port))
         try:
             if self.source:
-                self.sock.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
-                                     pack_mreq_source(group, self.source, iface_ip))
+                sock.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
+                                pack_mreq_source(self.group, self.source, self.iface_ip))
             else:
-                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                                     pack_mreq(group, iface_ip))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                pack_mreq(self.group, self.iface_ip))
         except OSError:
-            self.sock.close()
+            sock.close()
             raise
+        return sock
 
-        if self.port:
-            self.sock.settimeout(0.5)
-            t = threading.Thread(target=self._recv_loop, daemon=True)
-            t.start()
+    # -- port auto-detection --------------------------------------------------
+
+    def _start_probe(self):
+        """No port given: listen on well-known multicast ports for a while."""
+        probes = []
+        for p in WELL_KNOWN_PORTS:
+            try:
+                probes.append((p, self._make_socket(p)))
+            except OSError:
+                continue
+        self._probes = probes
+        self.detect = "probing"
+        threading.Thread(target=self._probe_loop, daemon=True).start()
+
+    def _probe_loop(self):
+        import select
+        end = time.time() + PROBE_SECONDS
+        by_sock = {s: p for p, s in self._probes}
+        while not self._stop.is_set() and time.time() < end and self.port is None:
+            try:
+                r, _, _ = select.select(list(by_sock), [], [], 0.5)
+            except (OSError, ValueError):
+                break
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                except OSError:
+                    continue
+                if self.port is None:
+                    self._adopt(s, by_sock[s], "probe", first=data)
+                    return
+        self._close_probes()
+        if self.port is None and self.detect == "probing":
+            self.detect = "none"
+
+    def _close_probes(self, keep=None):
+        for _p, s in self._probes:
+            if s is not keep:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self._probes = []
+
+    def _adopt(self, sock, port, how, first=None):
+        """Switch to a socket bound to the detected port and start counting."""
+        old = self.sock
+        self.sock, self.port, self.port_auto, self.detect = sock, port, how, None
+        self._close_probes(keep=sock)
+        if self.detector:
+            self.detector.stop()
+            self.detector = None
+        if first is not None:
+            self.packets += 1
+            self.bytes += len(first)
+        sock.settimeout(0.5)
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+        try:
+            old.close()   # the new socket already holds the membership -> no IGMP leave
+        except OSError:
+            pass
+
+    def set_port(self, port, how="sniff"):
+        if self.port is not None:
+            return
+        self._adopt(self._make_socket(port), port, how)
+
+    def start_sniff(self):
+        """Accurate detection by capturing UDP traffic to the group (elevated)."""
+        if self.port is not None or self.detector:
+            return
+        self._close_probes()
+
+        def on_port(port, _src):
+            try:
+                self.set_port(port)
+            except OSError:
+                pass
+        self.detector = PortDetector(self.iface_ip, self.group, on_port)
+        self.detect = "sniff"
+
+    def detect_text(self):
+        """Human-readable detection state for the UI while no port is known."""
+        if self.port is not None:
+            return None
+        if self.detect == "probing":
+            return "auto-detecting (well-known ports) …"
+        if self.detect == "sniff" and self.detector:
+            kind, msg = self.detector.phase()
+            return {"ok": "sniffing traffic for the port …",
+                    "wait": "waiting for authorization …"}.get(kind, f"error: {msg}")
+        return "no known port seen · use Detect port"
 
     def _recv_loop(self):
         # Survives the interface going down (Windows raises on recv then):
@@ -197,6 +307,10 @@ class Join:
 
     def leave(self):
         self._stop.set()
+        self._close_probes()
+        if self.detector:
+            self.detector.stop()
+            self.detector = None
         try:
             if self.source:
                 self.sock.setsockopt(socket.IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP,
@@ -223,6 +337,8 @@ class Join:
             "packets": self.packets,
             "bytes": self.bytes,
             "error": self.rx_error,
+            "port_auto": self.port_auto,
+            "detect": self.detect_text(),
         }
 
 
@@ -402,6 +518,106 @@ class RawCaptureSource:
             pass
 
 
+def _iface_name_for(ip):
+    for e in list_interfaces():
+        name, addr = (e["name"], e["ip"]) if isinstance(e, dict) else e
+        if addr == ip:
+            return name
+    return None
+
+
+def _udp_dst_port(pkt, group):
+    """dst UDP port if pkt is an IPv4/UDP datagram addressed to group, else None."""
+    if len(pkt) < 28 or pkt[0] >> 4 != 4 or pkt[9] != 17:
+        return None
+    if socket.inet_ntoa(pkt[16:20]) != group:
+        return None
+    ihl = (pkt[0] & 0x0F) * 4
+    if len(pkt) < ihl + 4:
+        return None
+    return int.from_bytes(pkt[ihl + 2:ihl + 4], "big"), socket.inet_ntoa(pkt[12:16])
+
+
+class PortSniffSource:
+    """Privileged capture of UDP traffic to a multicast group; calls
+    on_port(port, src) once per newly seen destination port. Windows: raw
+    socket with RCVALL; Linux: raw IPPROTO_UDP socket; macOS: raw sockets do
+    not see UDP, so tcpdump (always present) is used."""
+
+    def __init__(self, iface_ip, group, on_port):
+        self.group, self.on_port = group, on_port
+        self.seen = set()
+        self._stop = threading.Event()
+        self.proc = None
+        self.sock = None
+        if SYSTEM == "Darwin":
+            if os.geteuid() != 0:
+                raise PermissionError("capturing UDP needs root")
+            name = _iface_name_for(iface_ip)
+            if not name:
+                raise OSError(f"no interface with address {iface_ip}")
+            self.proc = subprocess.Popen(
+                ["tcpdump", "-i", name, "-p", "-n", "-l", "-q", "-t", f"udp and dst host {group}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            threading.Thread(target=self._tcpdump_loop, daemon=True).start()
+        else:
+            if SYSTEM == "Windows":
+                s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+                s.bind((iface_ip, 0))
+                s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+            s.settimeout(0.5)
+            self.sock = s
+            threading.Thread(target=self._raw_loop, daemon=True).start()
+
+    def _report(self, port, src):
+        if port not in self.seen:
+            self.seen.add(port)
+            try:
+                self.on_port(port, src)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _tcpdump_loop(self):
+        pat = re.compile(r"IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > \d+\.\d+\.\d+\.\d+\.(\d+): UDP")
+        for line in self.proc.stdout:
+            if self._stop.is_set():
+                break
+            m = pat.search(line)
+            if m:
+                self._report(int(m.group(3)), m.group(1))
+
+    def _raw_loop(self):
+        while not self._stop.is_set():
+            try:
+                pkt = self.sock.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+                continue
+            r = _udp_dst_port(pkt, self.group)
+            if r:
+                self._report(*r)
+
+    def stop(self):
+        self._stop.set()
+        if self.proc:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+
+
 _STAGED = {}
 _STAGE_DIRS = []
 
@@ -465,6 +681,8 @@ class ElevatedHelper:
         self.error = None
         self.dead = False
         self._pending = None
+        self.sniff_cbs = {}      # id -> (iface, group, callback)
+        self.sniff_errors = {}
         self._proc = None
         self._send_lock = threading.Lock()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -556,12 +774,21 @@ class ElevatedHelper:
             self.error = None
             if self._pending:
                 self._send({"cmd": "start", "iface": self._pending})
+            for sid, (iface, group, _cb) in list(self.sniff_cbs.items()):
+                self._send({"cmd": "sniff", "id": sid, "iface": iface, "group": group})
             for line in f:
                 try:
                     msg = json.loads(line)
                 except ValueError:
                     continue
-                if "error" in msg:
+                if "sniff" in msg:
+                    if "error" in msg:
+                        self.sniff_errors[msg["sniff"]] = msg["error"]
+                    else:
+                        ent = self.sniff_cbs.get(msg["sniff"])
+                        if ent:
+                            ent[2](msg["port"], msg.get("src"))
+                elif "error" in msg:
                     self.error = msg["error"]
                 elif "src" in msg and self.state:
                     self.state.ingest(msg)
@@ -601,6 +828,16 @@ class ElevatedHelper:
         self.state = None
         self._send({"cmd": "stop"})
 
+    def sniff(self, sid, iface_ip, group, cb):
+        self.sniff_cbs[sid] = (iface_ip, group, cb)
+        self.sniff_errors.pop(sid, None)
+        if self.conn:
+            self._send({"cmd": "sniff", "id": sid, "iface": iface_ip, "group": group})
+
+    def stop_sniff(self, sid):
+        self.sniff_cbs.pop(sid, None)
+        self._send({"cmd": "stopsniff", "id": sid})
+
     def shutdown(self):
         self._fail("closed")
         self._kill_launcher()
@@ -631,6 +868,7 @@ def run_querier_helper(port, token):
 
     send({"token": token})
     capture = None
+    sniffs = {}
 
     def heartbeat():   # detects a vanished GUI, then exits
         while alive.is_set():
@@ -645,20 +883,35 @@ def run_querier_helper(port, token):
                 cmd = json.loads(line)
             except ValueError:
                 continue
-            if capture:
+            c = cmd.get("cmd")
+            if c in ("start", "stop") and capture:
                 capture.stop()
                 capture = None
-            if cmd.get("cmd") == "start":
+            if c == "start":
                 try:
                     capture = RawCaptureSource(cmd["iface"], _Relay())
                     send({"started": cmd["iface"]})
                 except OSError as exc:
                     send({"error": f"Raw socket failed in elevated helper: {exc}"})
+            elif c == "sniff":
+                sid = cmd["id"]
+                try:
+                    sniffs[sid] = PortSniffSource(
+                        cmd["iface"], cmd["group"],
+                        lambda p, s, sid=sid: send({"sniff": sid, "port": p, "src": s}))
+                except OSError as exc:
+                    send({"sniff": sid, "error": f"capture failed in elevated helper: {exc}"})
+            elif c == "stopsniff":
+                sn = sniffs.pop(cmd.get("id"), None)
+                if sn:
+                    sn.stop()
     except OSError:
         pass
     finally:
         if capture:
             capture.stop()
+        for sn in sniffs.values():
+            sn.stop()
         os._exit(0)
 
 
@@ -733,6 +986,43 @@ def api_querier(body):
         QMON = QuerierMonitor(iface_ip)   # asks for privileges via system dialog if needed
         return {"ok": True}
     return {"error": "unknown action"}
+
+
+class PortDetector:
+    """Facade for port sniffing: in-process when privileged, else via the
+    elevated helper (same session-wide authorization as the querier)."""
+
+    _next_id = 1
+    _lock = threading.Lock()
+
+    def __init__(self, iface_ip, group, on_port):
+        self.local = None
+        self.helper = None
+        with PortDetector._lock:
+            self.id = PortDetector._next_id
+            PortDetector._next_id += 1
+        try:
+            self.local = PortSniffSource(iface_ip, group, on_port)
+        except OSError:
+            self.helper = ElevatedHelper.shared()
+            self.helper.sniff(self.id, iface_ip, group, on_port)
+
+    def phase(self):
+        if self.local:
+            return "ok", "capturing"
+        h = self.helper
+        err = h.sniff_errors.get(self.id) or h.error
+        if err:
+            return "error", err
+        if not h.connected:
+            return "wait", "waiting for authorization"
+        return "ok", "capturing via elevated helper"
+
+    def stop(self):
+        if self.local:
+            self.local.stop()
+        elif self.helper:
+            self.helper.stop_sniff(self.id)
 
 
 # ---------------------------------------------------------------- library ---
@@ -869,7 +1159,17 @@ def api_join(body):
     with JOINS_LOCK:
         for j in JOINS.values():
             if (j.group, j.source or "", j.iface_ip) == (group, source, iface_ip):
-                return {"error": "This join is already active"}
+                if j.port is None and port:
+                    try:
+                        j.set_port(port, how=None)   # upgrade the existing join
+                    except OSError as exc:
+                        return {"error": f"Could not open port {port}: {exc}"}
+                    LIBRARY.remove(group, source, None)
+                    LIBRARY.remember(group, source, port)
+                    return {"ok": True, "join": j.to_dict(),
+                            "note": f"Port {port} set on the existing join for {group}."}
+                if j.port == port:
+                    return {"error": "This join is already active"}
         try:
             j = Join(group, source, iface_ip, iface_name, port)
         except OSError as exc:
@@ -877,6 +1177,33 @@ def api_join(body):
         JOINS[j.id] = j
     LIBRARY.remember(group, source, port)
     return {"ok": True, "join": j.to_dict()}
+
+
+def api_detect_port(body):
+    with JOINS_LOCK:
+        j = JOINS.get(body.get("id"))
+    if not j:
+        return {"error": "Join not found"}
+    if j.port is not None:
+        return {"error": f"{j.group} already has port {j.port}"}
+    j.start_sniff()
+    return {"ok": True}
+
+
+def _housekeeping():
+    """Called on each /api/joins poll: auto-sniff once the helper is authorized,
+    move detected ports into the library."""
+    helper = ElevatedHelper._shared
+    with JOINS_LOCK:
+        joins = list(JOINS.values())
+    for j in joins:
+        if j.port is None:
+            if j.detect == "none" and helper and helper.connected and not j.detector:
+                j.start_sniff()
+        elif j.port_auto and not getattr(j, "_lib_done", False):
+            j._lib_done = True
+            LIBRARY.remove(j.group, j.source or "", None)
+            LIBRARY.remember(j.group, j.source or "", j.port)
 
 
 def api_library(body):
@@ -933,6 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/interfaces":
             self._send_json({"interfaces": list_interfaces(), "system": SYSTEM})
         elif self.path == "/api/joins":
+            _housekeeping()
             with JOINS_LOCK:
                 self._send_json({"joins": [j.to_dict() for j in JOINS.values()],
                                  "now": time.time()})
@@ -966,6 +1294,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(api_querier(body))
         elif self.path == "/api/library":
             self._send_json(api_library(body))
+        elif self.path == "/api/detect_port":
+            self._send_json(api_detect_port(body))
         else:
             self.send_error(404)
 
@@ -1088,7 +1418,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div id="msg"></div>
     <p class="hint">Without a source an ASM join (IGMPv2/v3) is sent, with a source an SSM join (IGMPv3, INCLUDE).
-    With a port the tool counts received packets and shows the bitrate — without a port only the membership is held. The interface list refreshes automatically.</p>
+    With a port the tool counts received packets and shows the bitrate. Without a port it auto-detects well-known ports; "Detect port" captures any port (admin rights via system dialog). The interface list refreshes automatically.</p>
   </div>
 
   <div class="toolbar">
@@ -1187,7 +1517,8 @@ function fmtUp(s) {
 }
 
 async function refresh() {
-  const d = await api("/api/joins");
+  let d;
+  try { d = await api("/api/joins"); } catch (e) { console.warn("joins poll failed", e); return; }
   const rows = $("rows");
   rows.innerHTML = "";
   $("empty").style.display = d.joins.length ? "none" : "block";
@@ -1210,11 +1541,18 @@ async function refresh() {
       <td>${j.group}</td>
       <td>${j.source || '<span class="muted">*</span>'}</td>
       <td>${j.iface_name} <span class="muted">(${j.iface_ip})</span></td>
-      <td>${j.port || '<span class="muted">—</span>'}</td>
-      <td>${j.port ? j.packets.toLocaleString() : '<span class="muted" title="Without a UDP port the membership is held but packets cannot be counted">set port to count</span>'}</td>
+      <td>${j.port ? j.port + (j.port_auto ? ' <span class="muted">(auto)</span>' : '') : '<span class="muted">—</span>'}</td>
+      <td>${j.port ? j.packets.toLocaleString() : '<span class="muted">' + (j.detect || 'set port to count') + '</span>'}</td>
       <td>${rateCell}</td>
       <td class="muted">${fmtUp(j.uptime)}</td>
       <td></td>`;
+    if (!j.port) {
+      const db = document.createElement("button");
+      db.className = "ghost mini"; db.textContent = "Detect port"; db.style.marginRight = "6px";
+      db.title = "Capture the UDP port of this group's traffic (asks for admin rights once per session)";
+      db.onclick = async () => { const r = await api("/api/detect_port", {id: j.id}); if (r.error) showErr(r.error); refresh(); };
+      tr.lastElementChild.appendChild(db);
+    }
     const btn = document.createElement("button");
     btn.className = "leave"; btn.textContent = "Leave";
     btn.onclick = async () => { await api("/api/leave", {id: j.id}); refresh(); };
@@ -1235,7 +1573,8 @@ $("joinBtn").onclick = async () => {
     port: $("port").value,
   });
   if (d.error) { showErr(d.error); return; }
-  if (!d.join.port) showNote(`Joined ${d.join.group}: membership is held, but without a UDP port no packets can be counted. Enter the stream's UDP port to see packets and bitrate.`);
+  if (d.note) showNote(d.note);
+  else if (!d.join.port) showNote(`Joined ${d.join.group}: no UDP port given, auto-detecting on well-known ports. For any other port use "Detect port" (asks for admin rights) or enter the port and join again.`);
   $("group").value = ""; $("source").value = "";
   refresh(); loadLibrary();
 };
