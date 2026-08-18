@@ -829,7 +829,7 @@ class App:
         ttk.Label(form, text="Multicast group *").grid(row=0, column=0, sticky="w", **pad)
         ttk.Label(form, text="Source (optional, SSM)").grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(form, text="Interface *").grid(row=0, column=2, sticky="w", **pad)
-        ttk.Label(form, text="UDP port (optional)").grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(form, text="UDP port (for packet stats)").grid(row=0, column=3, sticky="w", **pad)
 
         self.e_group = ttk.Entry(form, width=18)
         self.e_group.grid(row=1, column=0, sticky="we", **pad)
@@ -969,6 +969,7 @@ class App:
 
     def do_join(self):
         self.err.set("")
+        self.lbl_err.configure(foreground="#c62828")
         group = self.e_group.get().strip()
         source = self.e_source.get().strip()
         port_raw = self.e_port.get().strip()
@@ -1015,6 +1016,14 @@ class App:
             "●", group, source or "*", f"{iface_name} ({iface_ip})",
             port or "—", "—", "—", "0s"), tags=("idle",))
         self.joins[item] = j
+        if not port:
+            self.err.set("")
+            self.lbl_err.configure(foreground="#777")
+            self.err.set(f"Joined {group}: membership is held, but without a UDP port "
+                         "no packets can be counted. Enter the stream's UDP port to see "
+                         "packets and bitrate.")
+        else:
+            self.lbl_err.configure(foreground="#c62828")
         self.e_group.delete(0, "end")
         self.e_source.delete(0, "end")
         LIBRARY.remember(group, source, port)
@@ -1157,7 +1166,7 @@ class App:
         try:
             now = time.time()
             for item, j in self.joins.items():
-                rate_s, pkts_s, rx = "—", "—", False
+                rate_s, pkts_s, rx = "—", "set port to count", False
                 if j.port:
                     pkts_s = f"{j.packets:,}"
                     p = self.prev.get(item)

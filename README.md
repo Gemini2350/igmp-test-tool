@@ -18,9 +18,9 @@ Prebuilt binaries under [**Releases**](https://github.com/Gemini2350/igmp-test-t
 - **macOS** (Intel + Apple Silicon, universal): `IGMP-Test-Tool-macOS-universal.zip` —
   unzip and run. Not notarized: on first launch right-click → Open, or
   `xattr -cr "IGMP Test Tool.app"`.
-- **Windows**: `IGMP-Test-Tool-Windows.exe` — runs directly, no Python required
-  (confirm the SmartScreen warning once). Local build still possible via
-  `build_windows.bat`.
+- **Windows**: `IGMP-Test-Tool-Windows.zip` — unzip and run `IGMP Test Tool.exe`
+  from the folder, no Python required (confirm the SmartScreen warning once).
+  Local build still possible via `build_windows.bat`.
 - Without build: `python3 igmp_join_gui.py`.
 
 ## Web GUI variant
@@ -43,7 +43,7 @@ Options: `--port <n>` (GUI port), `--no-browser`.
 | Multicast group | Required, e.g. `239.1.1.1` |
 | Source | Optional — with a source an SSM join (IGMPv3, INCLUDE mode) is sent, without one an ASM join |
 | Interface | Interface the IGMP report is sent on. The list refreshes automatically (e.g. when a USB adapter is plugged in); ⟳ forces an immediate refresh |
-| UDP port | Optional — with a port the tool counts received packets and shows the bitrate (e.g. `5004` for ST 2110/AES67); without a port only the membership is held |
+| UDP port | Needed for packet statistics: with a port the tool counts received packets and shows the bitrate (e.g. `5004` for ST 2110/AES67, `2467` for Q-SYS discovery); without a port only the membership is held and the row shows "set port to count" |
 
 The green dot pulses while packets are arriving. If the interface goes down
 under an active join, the row turns red ("interrupted") and the tool
@@ -100,6 +100,17 @@ helper automatically; from `/Applications` it runs directly.
 
 General queries typically arrive only every 60–125 s — wait a moment after
 starting the analysis. Joins/statistics never need elevated privileges.
+
+## Antivirus false positives (Windows)
+
+Unsigned PyInstaller executables are sometimes flagged by heuristics. The
+release build minimises this (bootloader compiled from source, folder layout
+instead of a self-extracting exe, version metadata), but if your scanner
+still complains: the exe is built transparently by the public GitHub Actions
+workflow in this repo, so you can inspect the build log or build it yourself
+with `build_windows.bat`; report the false positive to your AV vendor
+(Microsoft: https://www.microsoft.com/wdsi/filesubmission); or run the
+Python file directly, `py igmp_join_gui.py`, which needs no build at all.
 
 ## Notes
 

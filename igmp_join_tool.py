@@ -1001,7 +1001,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .grid {
     display: grid; gap: 14px;
-    grid-template-columns: 1.4fr 1.2fr 1.2fr .7fr auto;
+    grid-template-columns: 1.2fr 1.1fr 1.6fr .8fr auto;
     align-items: end;
   }
   @media (max-width: 820px) { .grid { grid-template-columns: 1fr 1fr; } }
@@ -1049,6 +1049,7 @@ INDEX_HTML = r"""<!doctype html>
     display: none; border: 1px solid var(--danger); color: var(--danger);
     background: rgba(229, 83, 75, .08);
   }
+  #msg.note { border-color: var(--border); color: var(--muted); background: transparent; }
   .empty { color: var(--muted); text-align: center; padding: 28px 0; font-size: 14px; }
   tr.lib { cursor: pointer; }
   tr.lib:hover td { background: var(--panel2); }
@@ -1078,7 +1079,7 @@ INDEX_HTML = r"""<!doctype html>
         <select id="iface"></select>
       </div>
       <div>
-        <label><b>UDP port</b> (optional)</label>
+        <label><b>UDP port</b> (for packet stats)</label>
         <input id="port" placeholder="5004" inputmode="numeric" spellcheck="false">
       </div>
       <div>
@@ -1139,7 +1140,11 @@ async function api(path, body) {
 
 function showErr(text) {
   const m = $("msg");
-  m.textContent = text; m.style.display = text ? "block" : "none";
+  m.className = ""; m.textContent = text; m.style.display = text ? "block" : "none";
+}
+function showNote(text) {
+  const m = $("msg");
+  m.className = "note"; m.textContent = text; m.style.display = "block";
 }
 
 let ifaceKey = "";
@@ -1206,7 +1211,7 @@ async function refresh() {
       <td>${j.source || '<span class="muted">*</span>'}</td>
       <td>${j.iface_name} <span class="muted">(${j.iface_ip})</span></td>
       <td>${j.port || '<span class="muted">—</span>'}</td>
-      <td>${j.port ? j.packets.toLocaleString() : '<span class="muted">—</span>'}</td>
+      <td>${j.port ? j.packets.toLocaleString() : '<span class="muted" title="Without a UDP port the membership is held but packets cannot be counted">set port to count</span>'}</td>
       <td>${rateCell}</td>
       <td class="muted">${fmtUp(j.uptime)}</td>
       <td></td>`;
@@ -1230,6 +1235,7 @@ $("joinBtn").onclick = async () => {
     port: $("port").value,
   });
   if (d.error) { showErr(d.error); return; }
+  if (!d.join.port) showNote(`Joined ${d.join.group}: membership is held, but without a UDP port no packets can be counted. Enter the stream's UDP port to see packets and bitrate.`);
   $("group").value = ""; $("source").value = "";
   refresh(); loadLibrary();
 };
