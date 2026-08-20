@@ -16,8 +16,10 @@ Prebuilt binaries under [**Releases**](https://github.com/Gemini2350/igmp-test-t
 (built automatically by GitHub Actions):
 
 - **macOS** (Intel + Apple Silicon, universal): `IGMP-Test-Tool-macOS-universal.zip` —
-  unzip and run. Not notarized: on first launch right-click → Open, or
-  `xattr -cr "IGMP Test Tool.app"`.
+  unzip and run. If the build is not notarized, on first launch right-click →
+  Open, or `xattr -cr "IGMP Test Tool.app"`. (Maintainers: add the signing
+  secrets from [SIGNING.md](SIGNING.md) to ship notarized builds that open
+  with a normal double-click.)
 - **Windows**: `IGMP-Test-Tool-Windows.zip` — unzip and run `IGMP Test Tool.exe`
   from the folder, no Python required (confirm the SmartScreen warning once).
   Local build still possible via `build_windows.bat`.

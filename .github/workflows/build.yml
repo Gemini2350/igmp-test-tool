@@ -11,6 +11,16 @@ permissions:
 jobs:
   macos:
     runs-on: macos-latest
+    # Signing/notarization run only when the repo has the secrets configured
+    # (see SIGNING.md). Without them the app is built ad-hoc as before, so
+    # forks keep working.
+    env:
+      CERT_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      NOTARY_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+      NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,7 +31,48 @@ jobs:
           pip install pyinstaller
           pyinstaller --noconfirm --windowed --target-architecture universal2 \
             --name "IGMP Test Tool" igmp_join_gui.py
+          # fallback artifact (ad-hoc); replaced below when signing secrets exist
           ditto -c -k --keepParent "dist/IGMP Test Tool.app" "IGMP-Test-Tool-macOS-universal.zip"
+
+      - name: Sign & notarize (Developer ID)
+        if: env.CERT_P12_BASE64 != ''
+        run: |
+          set -euo pipefail
+          APP="dist/IGMP Test Tool.app"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+
+          # import the Developer ID Application certificate into a temp keychain
+          security create-keychain -p "$CERT_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$CERT_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CERT_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # sign every nested Mach-O first, then the bundle (hardened runtime)
+          while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then
+              codesign --force --timestamp --options runtime \
+                --sign "$SIGN_IDENTITY" "$f"
+            fi
+          done < <(find "$APP/Contents" -type f)
+          codesign --force --timestamp --options runtime \
+            --entitlements entitlements.plist --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # notarize and staple the ticket into the bundle
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          ditto -c -k --keepParent "$APP" "IGMP-Test-Tool-macOS-universal.zip"
+
       - uses: actions/upload-artifact@v4
         with:
           name: macOS
