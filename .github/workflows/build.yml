@@ -96,18 +96,31 @@ jobs:
       # (no self-extraction to %TEMP%), add a version resource, ship as zip.
       - name: Install PyInstaller with freshly compiled bootloader
         run: pip install --no-binary pyinstaller pyinstaller
-      - name: Build (onedir)
+      # Ship both layouts: the single-file exe is immune to the "failed to load
+      # python3xx.dll" error (nothing external to lose), the folder zip is the
+      # fallback if antivirus blocks the single exe. Build onefile first and
+      # copy it out before the onedir run overwrites dist/.
+      - name: Build single-file exe
         run: |
-          pyinstaller --noconfirm --onedir --windowed --name "IGMP Test Tool" `
+          pyinstaller --noconfirm --clean --onefile --windowed --name "IGMP Test Tool" `
+            --version-file version_info.txt igmp_join_gui.py
+          Copy-Item "dist/IGMP Test Tool.exe" "IGMP-Test-Tool-Windows.exe"
+      - name: Build folder (antivirus fallback)
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed --name "IGMP Test Tool" `
             --version-file version_info.txt igmp_join_gui.py
           Copy-Item README.md, LICENSE "dist/IGMP Test Tool/"
-          Compress-Archive -Path "dist/IGMP Test Tool" -DestinationPath "IGMP-Test-Tool-Windows.zip"
+          Compress-Archive -Force -Path "dist/IGMP Test Tool" -DestinationPath "IGMP-Test-Tool-Windows-folder.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: Windows
-          path: IGMP-Test-Tool-Windows.zip
+          path: |
+            IGMP-Test-Tool-Windows.exe
+            IGMP-Test-Tool-Windows-folder.zip
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: IGMP-Test-Tool-Windows.zip
+          files: |
+            IGMP-Test-Tool-Windows.exe
+            IGMP-Test-Tool-Windows-folder.zip

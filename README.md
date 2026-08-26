@@ -20,8 +20,12 @@ Prebuilt binaries under [**Releases**](https://github.com/Gemini2350/igmp-test-t
   Open, or `xattr -cr "IGMP Test Tool.app"`. (Maintainers: add the signing
   secrets from [SIGNING.md](SIGNING.md) to ship notarized builds that open
   with a normal double-click.)
-- **Windows**: `IGMP-Test-Tool-Windows.zip` — unzip and run `IGMP Test Tool.exe`
-  from the folder, no Python required (confirm the SmartScreen warning once).
+- **Windows**: `IGMP-Test-Tool-Windows.exe` — a single self-contained file,
+  no Python required (confirm the SmartScreen warning once). If your antivirus
+  blocks the single exe, use `IGMP-Test-Tool-Windows-folder.zip` instead:
+  **extract the whole folder first**, then run `IGMP Test Tool.exe` from it.
+  Running the exe straight out of the zip fails with *"failed to load
+  python3xx.dll"* because the `_internal` folder next to it is required.
   Local build still possible via `build_windows.bat`.
 - Without build: `python3 igmp_join_gui.py`.
 
@@ -123,13 +127,18 @@ starting the analysis. Joins/statistics never need elevated privileges.
 ## Antivirus false positives (Windows)
 
 Unsigned PyInstaller executables are sometimes flagged by heuristics. The
-release build minimises this (bootloader compiled from source, folder layout
-instead of a self-extracting exe, version metadata), but if your scanner
-still complains: the exe is built transparently by the public GitHub Actions
-workflow in this repo, so you can inspect the build log or build it yourself
-with `build_windows.bat`; report the false positive to your AV vendor
-(Microsoft: https://www.microsoft.com/wdsi/filesubmission); or run the
-Python file directly, `py igmp_join_gui.py`, which needs no build at all.
+release build minimises this (bootloader compiled from source, version
+metadata), and ships two layouts: the single-file `.exe` and the
+`-folder.zip`. If your scanner flags the single exe, try the folder zip (or
+vice versa). If it still complains: the build is fully transparent in the
+public GitHub Actions log, or build it yourself with `build_windows.bat`;
+report the false positive to your AV vendor (Microsoft:
+https://www.microsoft.com/wdsi/filesubmission); or run the Python file
+directly, `py igmp_join_gui.py`, which needs no build at all.
+
+Note: if the antivirus quarantines `_internal\python3xx.dll` from the folder
+build, the exe fails with *"failed to load python3xx.dll"* — restore the file
+or use the single-file exe instead.
 
 ## Notes
 

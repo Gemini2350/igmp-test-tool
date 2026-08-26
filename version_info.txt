@@ -2,8 +2,8 @@
 # file properties; also lowers heuristic AV scores for unsigned binaries).
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 1, 0),
-    prodvers=(1, 5, 1, 0),
+    filevers=(1, 6, 1, 0),
+    prodvers=(1, 6, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', 'Gemini2350 (open source)'),
         StringStruct('FileDescription', 'IGMP Test Tool - multicast join and querier analysis'),
-        StringStruct('FileVersion', '1.5.1.0'),
+        StringStruct('FileVersion', '1.6.1.0'),
         StringStruct('InternalName', 'IGMP Test Tool'),
         StringStruct('LegalCopyright', 'MIT License - https://github.com/Gemini2350/igmp-test-tool'),
         StringStruct('OriginalFilename', 'IGMP Test Tool.exe'),
         StringStruct('ProductName', 'IGMP Test Tool'),
-        StringStruct('ProductVersion', '1.5.1.0')
+        StringStruct('ProductVersion', '1.6.1.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
